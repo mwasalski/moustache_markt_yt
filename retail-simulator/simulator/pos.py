@@ -1,9 +1,11 @@
 """Store POS exports (CSV).
 
-v1 (legacy POS): one central file per business day, cp1250, ';', decimal comma ('1 299,99'),
-    local time without offset, Windows line endings. No file when every store is closed.
-v2 (new POS vendor): one file per store and day, UTF-8, ',', dot decimals, ISO-8601 with
-    offset, renamed and reordered columns, vat_code letter -> vat_rate number, new promo_code.
+v1 (legacy POS): one central file per business day, cp1252, '|', thousands separators ('1,299.99'),
+    12-hour local time without offset ('03/14/2025 07:22:33 PM'), Windows line endings.
+    No file when every store is closed.
+v2 (new POS vendor): one file per store and day, UTF-8, ',', plain decimals, ISO-8601 with
+    offset, renamed and reordered columns, tax_code letter -> tax_rate number (percent, depends on
+    the store's state), new promo_code.
 """
 
 from __future__ import annotations
@@ -15,28 +17,28 @@ from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
 from . import reference_data as ref
-from .calendar_pl import (STORE_HOURS_SUNDAY, STORE_HOURS_WEEKDAY, demand_multiplier, is_black_week,
-                          is_trading_day, local_to_utc, next_trading_day, sample_local_time, warsaw_utc_offset)
+from .calendar_us import (STORE_HOURS_SUNDAY, STORE_HOURS_WEEKDAY, demand_multiplier, eastern_utc_offset,
+                          is_black_week, is_trading_day, local_to_utc, next_trading_day, sample_local_time)
 from .chaos import corrupt_amount, lateness, with_duplicates
-from .formats import pl_amount
+from .formats import us_amount
 from .rng import Weighted, make_rng, pick_weighted, poisson
-from .world import CENT, ZERO, DayContext, Location, World, ean13
+from .world import CENT, ZERO, DayContext, Location, World, ean13, sales_tax_rate
 from .writers import CsvFormat, OutputFile
 
 V1_FORMAT = CsvFormat(
     columns=("store_code", "register_no", "receipt_no", "receipt_local_ts", "cashier_id", "line_no", "ean",
-             "item_name", "quantity", "unit_price_gross", "discount_gross", "vat_code", "transaction_type",
+             "item_name", "quantity", "item_price", "item_discount", "tax_code", "transaction_type",
              "payment_type", "loyalty_card_no"),
-    delimiter=";", encoding="cp1250", line_terminator="\r\n",
+    delimiter="|", encoding="cp1252", line_terminator="\r\n",
 )
 V2_FORMAT = CsvFormat(
     columns=("receipt_id", "store_code", "receipt_ts", "line_no", "ean", "item_name", "qty", "unit_price",
-             "discount", "vat_rate", "tx_type", "payment_method", "loyalty_card_no", "promo_code", "cashier_id"),
+             "discount", "tax_rate", "tx_type", "payment_method", "loyalty_card_no", "promo_code", "cashier_id"),
     delimiter=",", encoding="utf-8", line_terminator="\n",
 )
-LATE_LOOKBACK_DAYS = 7  # covers two late export runs across Easter/Christmas closures
+LATE_LOOKBACK_DAYS = 7  # covers two late export runs across store closure days
 LINE_COUNTS = Weighted([(1, 0.6), (2, 0.25), (3, 0.1), (4, 0.04), (5, 0.01)])
-PAYMENT_TYPES = Weighted([("CARD", 0.52), ("BLIK", 0.2), ("CASH", 0.2), ("INSTALLMENTS", 0.08)])
+PAYMENT_TYPES = Weighted([("CARD", 0.55), ("MOBILE_WALLET", 0.2), ("CASH", 0.17), ("INSTALLMENTS", 0.08)])
 TRAINING_EAN = ean13("200000000000")  # in-store barcode range 20-29
 STORE_DISCOUNT = Decimal("0.05")
 
@@ -47,7 +49,7 @@ class PosLine:
     business_day: date
     register_no: int
     receipt_no: int
-    local_ts: datetime  # naive Europe/Warsaw
+    local_ts: datetime  # naive America/New_York
     cashier_id: str
     line_no: int
     ean: str
@@ -89,18 +91,18 @@ def store_day_lines(world: World, store: Location, day: date) -> list[PosLine]:
         if card and unknown_card_roll < config.chaos.dirty_value_rate / 3:
             card = ean13(f"29{unknown_card_digits:010d}")  # a card number the CRM does not know
         if _is_training_receipt(rng, config.history_start, store, day):
-            cashier = "SZKOLENIE"  # test receipts from the opening week land in production data
-            items = [(TRAINING_EAN, "POZYCJA TESTOWA", 1, Decimal("1.00"), ZERO, "SALE")]
+            cashier = "TRAINING"  # test receipts from the opening week land in production data
+            items = [(TRAINING_EAN, "TEST ITEM", 1, Decimal("1.00"), ZERO, "SALE")]
         else:
             items = _receipt_items(rng, context, cashier)
         total = sum((unit * quantity - discount for _, _, quantity, unit, discount, _ in items), ZERO)
         payment = PAYMENT_TYPES(rng)
-        if payment == "INSTALLMENTS" and total < 1000:
+        if payment == "INSTALLMENTS" and total < 250:
             payment = "CARD"
         for line_no, (ean, name, quantity, unit, discount, tx_type) in enumerate(items, start=1):
             unknown_ean_roll, unknown_ean_digits = dirty_rng.random(), dirty_rng.randrange(10**9)
             if unknown_ean_roll < config.chaos.dirty_value_rate / 30:
-                ean = ean13(f"590{unknown_ean_digits:09d}")  # secondary barcode the ERP does not know
+                ean = ean13(f"086{unknown_ean_digits:09d}")  # secondary barcode the ERP does not know
             lines.append(PosLine(store.location_code, day, register, receipt_numbers[register], local_ts, cashier,
                                  line_no, ean, name, quantity, unit, discount, tx_type, payment, card, receipt_index))
     return lines
@@ -185,7 +187,7 @@ def _rows(world: World, lines: list[PosLine], version: str, file_key: str) -> li
             if corrupt_rng.random() < rate:
                 row[price_col] = corrupt_amount(line.unit_price, corrupt_rng)
             if corrupt_rng.random() < rate:
-                row[quantity_col] = f"{line.quantity} szt."
+                row[quantity_col] = f"{line.quantity} ea"
         rows.append(row)
     return with_duplicates(rows, config.chaos.duplicate_rate, make_rng(config.seed, "chaos-dup", "pos", file_key))
 
@@ -193,19 +195,21 @@ def _rows(world: World, lines: list[PosLine], version: str, file_key: str) -> li
 def _v1_row(line: PosLine) -> list[str]:
     return [
         line.store_code, str(line.register_no), f"{line.receipt_no:06d}",
-        line.local_ts.strftime("%d.%m.%Y %H:%M:%S"), line.cashier_id, str(line.line_no), line.ean,
-        line.item_name.upper()[:40], str(line.quantity), pl_amount(line.unit_price),
-        pl_amount(line.discount) if line.discount else "", "A", line.transaction_type, line.payment_type,
+        line.local_ts.strftime("%m/%d/%Y %I:%M:%S %p"), line.cashier_id, str(line.line_no), line.ean,
+        line.item_name.upper()[:40], str(line.quantity), us_amount(line.unit_price),
+        us_amount(line.discount) if line.discount else "", "T", line.transaction_type, line.payment_type,
         line.loyalty_card_no or "",
     ]
 
 
 def _v2_row(world: World, line: PosLine) -> list[str]:
-    offset_hours = int(warsaw_utc_offset(local_to_utc(line.local_ts)).total_seconds() // 3600)
+    offset_hours = int(eastern_utc_offset(local_to_utc(line.local_ts)).total_seconds() // 3600)
+    tax_rate = sales_tax_rate(world.store_by_code[line.store_code].state) * 100
     return [
         f"{line.store_code}-{line.business_day:%Y%m%d}-{line.register_no}-{line.receipt_no:06d}",
-        line.store_code, f"{line.local_ts:%Y-%m-%dT%H:%M:%S}+{offset_hours:02d}:00", str(line.line_no), line.ean,
-        line.item_name[:60], str(line.quantity), f"{line.unit_price:.2f}", f"{line.discount:.2f}", "23",
+        line.store_code, f"{line.local_ts:%Y-%m-%dT%H:%M:%S}{offset_hours:+03d}:00", str(line.line_no), line.ean,
+        line.item_name[:60], str(line.quantity), f"{line.unit_price:.2f}", f"{line.discount:.2f}",
+        f"{tax_rate.normalize():f}",
         line.transaction_type, line.payment_type, line.loyalty_card_no or "", _v2_promo_code(world, line),
         line.cashier_id,
     ]
@@ -215,4 +219,4 @@ def _v2_promo_code(world: World, line: PosLine) -> str:
     rng = make_rng(world.config.seed, "pos-v2-promo", line.store_code, line.business_day, line.receipt_index)
     if rng.random() >= 0.03:
         return ""
-    return "BLACK-SALON" if is_black_week(line.business_day) else "NEWSLETTER10"
+    return "BLACK-INSTORE" if is_black_week(line.business_day) else "NEWSLETTER10"

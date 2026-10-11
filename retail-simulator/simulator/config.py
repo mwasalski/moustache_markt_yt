@@ -13,7 +13,7 @@ SCHEMA_VERSIONS: tuple[str, ...] = ("v1", "v2")
 class ChaosConfig:
     duplicate_rate: float = 0.002  # exact duplicate records within a file
     late_arrival_rate: float = 0.01  # records (or whole store files) delivered 1-2 days late
-    dirty_value_rate: float = 0.03  # brand variants, invalid NIPs, messy e-mails, unknown barcodes
+    dirty_value_rate: float = 0.03  # brand variants, invalid EINs, messy e-mails, unknown barcodes
     type_corruption_rate: float = 0.0  # "$ 123" instead of a number - daily runs only, see cli.py
     parquet_type_drift_rate: float = 0.0  # an ERP file exports a numeric column as text
 

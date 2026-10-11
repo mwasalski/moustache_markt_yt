@@ -87,7 +87,7 @@ def _serialize(world: World, event: CrmEvent, version: str) -> dict:
     elif version == "v1":
         phone = format_phone(digits, state["phone_style"])
     else:
-        phone = {"country_code": "+48", "number": digits}
+        phone = {"country_code": "+1", "number": digits}
     record = {
         "_op": OPS[version][event.op],
         "_commit_ts": iso_utc(event.commit_ts),
@@ -122,10 +122,10 @@ def _preferred_store(world: World, customer_index: int, city: str | None) -> str
 
 
 def _corrupt_birth_dates(records: list[dict], rate: float, rng) -> None:
-    """Daily chaos: a front-end bug sends birth_date in a local format."""
+    """Daily chaos: a front-end bug sends birth_date in the US display format."""
     if rate <= 0:
         return
     for record in records:
         if record["birth_date"] and rng.random() < rate:
             year, month, day = record["birth_date"].split("-")
-            record["birth_date"] = rng.choice((f"{day}.{month}.{year}", f"{month}/{day}/{year}"))
+            record["birth_date"] = rng.choice((f"{month}/{day}/{year}", f"{int(month)}/{int(day)}/{year[2:]}"))

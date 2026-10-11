@@ -41,7 +41,7 @@ def pick_weighted(rng: random.Random, cum_weights: Sequence[float], upto: int | 
 
 
 class Weighted(Generic[T]):
-    """Reusable weighted choice: Weighted([("BLIK", 0.4), ("CARD", 0.6)])(rng)."""
+    """Reusable weighted choice: Weighted([("PAYPAL", 0.4), ("CARD", 0.6)])(rng)."""
 
     def __init__(self, options: Sequence[tuple[T, float]]) -> None:
         self.values = [value for value, _ in options]

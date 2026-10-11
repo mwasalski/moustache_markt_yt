@@ -1,7 +1,8 @@
 """ERP master data: a daily FULL snapshot per table, as Parquet (the typed, "easy" source).
 
-v2 (product only): vat_rate 0.23 -> 23.00 (same type, different meaning), weight_kg -> weight_g,
-new column energy_class. Category and location files do not change.
+tax_rate is the home-state (MA) default rate; the rate actually charged depends on where the item is sold.
+v2 (product only): tax_rate 0.0625 -> 6.2500 (same type, different meaning), weight_lb -> weight_oz,
+new column energy_star. Category and location files do not change.
 """
 
 from __future__ import annotations
@@ -9,9 +10,9 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
-from .formats import UTC, pl_amount
+from .formats import UTC, us_amount
 from .rng import make_rng
-from .world import VAT_RATE, Category, Location, Product, World, at_utc
+from .world import HOME_STATE_TAX_RATE, Category, Location, Product, World, at_utc
 from .writers import OutputFile
 
 CATEGORY_SCHEMA = (
@@ -20,22 +21,22 @@ CATEGORY_SCHEMA = (
 )
 LOCATION_SCHEMA = (
     ("location_id", "int32"), ("location_code", "string"), ("location_name", "string"), ("location_type", "string"),
-    ("store_format", "string"), ("city", "string"), ("voivodeship", "string"), ("postal_code", "string"),
-    ("latitude", "decimal(9,6)"), ("longitude", "decimal(9,6)"), ("floor_area_m2", "int32"),
+    ("store_format", "string"), ("city", "string"), ("state", "string"), ("postal_code", "string"),
+    ("latitude", "decimal(9,6)"), ("longitude", "decimal(9,6)"), ("floor_area_sqft", "int32"),
     ("opened_date", "date"), ("closed_date", "date"), ("updated_at", "timestamp"),
 )
 _PRODUCT_HEAD = (
     ("product_id", "int64"), ("sku", "string"), ("ean", "string"), ("product_name", "string"),
     ("brand_name", "string"), ("category_id", "int32"), ("primary_supplier_id", "int32"),
-    ("vat_rate", "decimal(4,2)"), ("standard_cost_net", "decimal(18,2)"),
+    ("tax_rate", "decimal(6,4)"), ("standard_cost", "decimal(18,2)"),
 )
 _PRODUCT_TAIL = (
     ("warranty_months", "int16"), ("launch_date", "date"), ("eol_date", "date"), ("status", "string"),
     ("created_at", "timestamp"), ("updated_at", "timestamp"),
 )
 PRODUCT_SCHEMA = {
-    "v1": _PRODUCT_HEAD + (("weight_kg", "decimal(8,3)"),) + _PRODUCT_TAIL,
-    "v2": _PRODUCT_HEAD + (("weight_g", "int32"), ("energy_class", "string")) + _PRODUCT_TAIL,
+    "v1": _PRODUCT_HEAD + (("weight_lb", "decimal(8,3)"),) + _PRODUCT_TAIL,
+    "v2": _PRODUCT_HEAD + (("weight_oz", "int32"), ("energy_star", "bool")) + _PRODUCT_TAIL,
 }
 EOL_ANNOUNCED_DAYS = 90
 CLOSURE_ANNOUNCED_DAYS = 30
@@ -76,13 +77,13 @@ def _product_row(product: Product, day: date, version: str) -> dict:
     row = {
         "product_id": product.product_id, "sku": product.sku, "ean": product.ean, "product_name": product.name,
         "brand_name": product.brand_name, "category_id": product.category_id, "primary_supplier_id": None,
-        "vat_rate": VAT_RATE if version == "v1" else Decimal("23.00"), "standard_cost_net": cost,
+        "tax_rate": HOME_STATE_TAX_RATE if version == "v1" else HOME_STATE_TAX_RATE * 100, "standard_cost": cost,
     }
     if version == "v1":
-        row["weight_kg"] = product.weight_kg
+        row["weight_lb"] = product.weight_lb
     else:
-        row["weight_g"] = int(product.weight_kg * 1000)
-        row["energy_class"] = product.energy_class
+        row["weight_oz"] = int(product.weight_lb * 16)
+        row["energy_star"] = product.energy_star
     row.update(
         warranty_months=product.warranty_months, launch_date=product.launch_date,
         eol_date=product.eol_date if eol_known else None, status=status,
@@ -99,19 +100,19 @@ def _location_row(location: Location, day: date) -> dict:
     return {
         "location_id": location.location_id, "location_code": location.location_code,
         "location_name": location.location_name, "location_type": location.location_type,
-        "store_format": location.store_format, "city": location.city, "voivodeship": location.voivodeship,
+        "store_format": location.store_format, "city": location.city, "state": location.state,
         "postal_code": location.postal_code, "latitude": location.latitude, "longitude": location.longitude,
-        "floor_area_m2": location.floor_area_m2, "opened_date": location.opened_date,
+        "floor_area_sqft": location.floor_area_sqft, "opened_date": location.opened_date,
         "closed_date": location.closed_date if closure_known else None, "updated_at": updated_at,
     }
 
 
 def _maybe_export_cost_as_text(world: World, day: date, rows: list[dict], schema: tuple) -> tuple[list[dict], tuple]:
-    """Chaos: on a bad day the ERP export writes standard_cost_net as '1 234,56 PLN' (whole file)."""
+    """Chaos: on a bad day the ERP export writes standard_cost as '1,234.56 USD' (whole file)."""
     rate = world.config.chaos.parquet_type_drift_rate
     if rate <= 0 or make_rng(world.config.seed, "chaos-erp-drift", day).random() >= rate:
         return rows, schema
     for row in rows:
-        cost = row["standard_cost_net"]
-        row["standard_cost_net"] = None if cost is None else f"{pl_amount(cost)} PLN"
-    return rows, tuple((name, "string" if name == "standard_cost_net" else kind) for name, kind in schema)
+        cost = row["standard_cost"]
+        row["standard_cost"] = None if cost is None else f"{us_amount(cost)} USD"
+    return rows, tuple((name, "string" if name == "standard_cost" else kind) for name, kind in schema)

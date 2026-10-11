@@ -1,149 +1,149 @@
-"""Idempotentny bootstrap Unity Catalog dla platformy retail: katalogi, schematy, volumes.
+"""Idempotent Unity Catalog bootstrap for the retail platform: catalogs, schemas, volumes.
 
-Użycie:
-    python uc_bootstrap.py --dry-run      # wypisz plan SQL, Spark niepotrzebny
-    python uc_bootstrap.py                # uruchom na Databricks (task joba / rozszerzenie VS Code)
-    python uc_bootstrap.py --envs dev     # wspólne źródła + tylko jedno środowisko
-    python uc_bootstrap.py --config inny.yml --dry-run   # inny plik konfiguracji
+Usage:
+    python uc_bootstrap.py --dry-run      # print the SQL plan, no Spark needed
+    python uc_bootstrap.py                # run on Databricks (job task / VS Code extension)
+    python uc_bootstrap.py --envs dev     # shared sources + a single environment only
+    python uc_bootstrap.py --config other.yml --dry-run   # a different config file
 
-Konfiguracja (nazwa projektu, środowiska, systemy, warstwy): config/platform.yml.
+Configuration (project name, environments, systems, layers): config/platform.yml.
 """
-# Docstring modułu (powyżej) - pierwsza wartość w pliku, trafia do `uc_bootstrap.__doc__`
-# i pokazuje się w `help(uc_bootstrap)`. Szczegóły użycia: README_uc_bootstrap.md.
+# Module docstring (above) - the first value in the file, ends up in `uc_bootstrap.__doc__`
+# and shows up in `help(uc_bootstrap)`. Usage details: README_uc_bootstrap.md.
 
-# Adnotacje typów są traktowane jako napisy i nie są wyliczane w runtime.
-# Dzięki temu składnia typu `str | None` czy `tuple[str, ...]` działa także na starszym
-# Pythonie i nie kosztuje nic przy imporcie. Ten import musi być pierwszą instrukcją w pliku.
+# Type annotations are treated as strings and are not evaluated at runtime.
+# Thanks to that, syntax like `str | None` or `tuple[str, ...]` also works on older
+# Python and costs nothing at import time. This import must be the first statement in the file.
 from __future__ import annotations
 
-# argparse - standardowy parser argumentów linii poleceń (--dry-run, --envs, --config).
+# argparse - the standard command-line argument parser (--dry-run, --envs, --config).
 import argparse
-# logging - standardowe logowanie; na Databricks logi trafiają do outputu joba/notebooka.
+# logging - standard logging; on Databricks the logs go to the job/notebook output.
 import logging
-# re - wyrażenia regularne, używane do walidacji nazw obiektów Unity Catalog.
+# re - regular expressions, used to validate Unity Catalog object names.
 import re
-# Abstrakcyjne typy kolekcji używane wyłącznie w adnotacjach:
-#   Callable - "coś, co można wywołać" (tu: funkcja wykonująca SQL, np. spark.sql),
-#   Iterable - "coś, po czym można iterować" (lista, generator, krotka...),
-#   Sequence - iterowalne z indeksowaniem i długością (lista, krotka).
+# Abstract collection types used only in annotations:
+#   Callable - "something that can be called" (here: a function executing SQL, e.g. spark.sql),
+#   Iterable - "something that can be iterated over" (list, generator, tuple...),
+#   Sequence - an iterable with indexing and a length (list, tuple).
 from collections.abc import Callable, Iterable, Sequence
-# dataclass - dekorator generujący __init__, __repr__, __eq__ na podstawie pól klasy.
-# fields - zwraca listę pól dataclassy; używamy jej, żeby wiedzieć, jakich kluczy oczekiwać w YAML.
+# dataclass - a decorator generating __init__, __repr__, __eq__ from the class fields.
+# fields - returns the list of dataclass fields; we use it to know which keys to expect in the YAML.
 from dataclasses import dataclass, fields
-# Path - obiektowa ścieżka do pliku; działa tak samo na Windows, Linuksie i w Workspace Databricks.
+# Path - an object-oriented file path; works the same on Windows, Linux and in the Databricks Workspace.
 from pathlib import Path
-# Any - "dowolny typ"; tak opisujemy surowe dane z YAML, zanim je zwalidujemy.
+# Any - "any type"; this is how we describe raw YAML data before validating it.
 from typing import Any
 
-# PyYAML - parser plików YAML. Zewnętrzna paczka (pip install pyyaml), preinstalowana na Databricks Runtime.
+# PyYAML - a YAML file parser. External package (pip install pyyaml), preinstalled on Databricks Runtime.
 import yaml
 
-# Logger nazwany nazwą modułu ("uc_bootstrap" albo "__main__" przy uruchomieniu skryptu).
-# Sam w sobie nic nie wypisuje - dopiero logging.basicConfig() w main() podpina handler.
+# Logger named after the module ("uc_bootstrap", or "__main__" when run as a script).
+# On its own it prints nothing - only logging.basicConfig() in main() attaches a handler.
 logger = logging.getLogger(__name__)
 
-# Domyślny plik konfiguracji, liczony względem TEGO pliku (__file__), a nie katalogu roboczego.
-# Katalog roboczy jest inny w terminalu, w notebooku i w jobie - __file__ jest zawsze ten sam.
-# resolve() zamienia ścieżkę na absolutną, .parent to folder z uc_bootstrap.py, "/" skleja ścieżki.
+# Default config file, resolved relative to THIS file (__file__), not the working directory.
+# The working directory differs in a terminal, a notebook and a job - __file__ is always the same.
+# resolve() makes the path absolute, .parent is the folder containing uc_bootstrap.py, "/" joins paths.
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config" / "platform.yml"
 
-# Stałe nazwy obiektów, które nie zależą od konfiguracji. Trzymane w jednym miejscu, bo używają
-# ich zarówno polecenia DDL, jak i ścieżki do volumes (landing_path, checkpoints_path).
+# Fixed object names that do not depend on the config. Kept in one place because they are used
+# both by the DDL statements and by the volume paths (landing_path, checkpoints_path).
 LANDING_SCHEMA = "landing"
 OPS_SCHEMA = "ops"
 CHECKPOINTS_VOLUME = "checkpoints"
 
-# Skompilowany raz (na poziomie modułu) regex poprawnej nazwy obiektu UC:
-#   ^        - początek napisu,
-#   [a-z]    - pierwszy znak to mała litera (nie cyfra, nie podkreślnik),
-#   [a-z0-9_]* - dalej dowolnie wiele małych liter, cyfr lub "_",
-#   $        - koniec napisu (nic więcej nie może się pojawić).
-# Czyli: lower snake_case. Odrzuca wielkie litery, myślniki, spacje, kropki, cudzysłowy, średniki.
+# Regex for a valid UC object name, compiled once (at module level):
+#   ^        - start of the string,
+#   [a-z]    - the first character is a lowercase letter (not a digit, not an underscore),
+#   [a-z0-9_]* - followed by any number of lowercase letters, digits or "_",
+#   $        - end of the string (nothing else may follow).
+# In other words: lower snake_case. Rejects uppercase letters, hyphens, spaces, dots, quotes, semicolons.
 UC_IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
-# frozen=True -> instancja jest niemutowalna (przypisanie do pola rzuca FrozenInstanceError)
-# i hashowalna. Konfiguracja platformy nie powinna się zmieniać w trakcie działania skryptu.
-# Pola NIE mają wartości domyślnych: jedynym źródłem wartości jest config/platform.yml.
-# Gdyby domyślne były i tu, i w YAML, prędzej czy później by się rozjechały.
+# frozen=True -> the instance is immutable (assigning to a field raises FrozenInstanceError)
+# and hashable. The platform config should not change while the script is running.
+# The fields have NO default values: the only source of values is config/platform.yml.
+# If defaults lived both here and in the YAML, sooner or later they would drift apart.
 @dataclass(frozen=True)
 class PlatformConfig:
-    # Prefiks wszystkich katalogów, np. "moustache_markt" -> moustache_markt_sources, moustache_markt_dev.
+    # Prefix of all catalogs, e.g. "moustache_markt" -> moustache_markt_sources, moustache_markt_dev.
     project: str
-    # Środowiska, dla których powstanie osobny katalog. Krotka (a nie lista), bo jest
-    # niemutowalna - pasuje do frozen=True (listę dałoby się zmienić "od środka").
+    # Environments that each get a separate catalog. A tuple (not a list) because it is
+    # immutable - it fits frozen=True (a list could be modified "from the inside").
     environments: tuple[str, ...]
-    # Systemy źródłowe - każdy dostaje volume w landingu i schemat bronze_<system> w każdym env.
+    # Source systems - each gets a volume in landing and a bronze_<system> schema in every env.
     source_systems: tuple[str, ...]
-    # Warstwy "wyczyszczone" (medallion) - wspólne dla wszystkich systemów, po jednym schemacie.
+    # "Cleaned" (medallion) layers - shared by all systems, one schema each.
     curated_layers: tuple[str, ...]
 
-    # @property -> wywołujemy bez nawiasów: config.sources_catalog.
-    # Nazwa jest wyliczana z `project`, więc nie da się jej rozsynchronizować z prefiksem.
+    # @property -> called without parentheses: config.sources_catalog.
+    # The name is derived from `project`, so it cannot get out of sync with the prefix.
     @property
     def sources_catalog(self) -> str:
-        # Katalog "świata zewnętrznego" - jeden, wspólny dla wszystkich środowisk.
+        # The "outside world" catalog - a single one, shared by all environments.
         return f"{self.project}_sources"
 
-    # Zwykła metoda, bo potrzebuje argumentu (nazwy środowiska).
+    # A regular method, because it needs an argument (the environment name).
     def env_catalog(self, env: str) -> str:
-        # Katalog platformy danych dla danego środowiska, np. "moustache_markt_dev".
+        # The data platform catalog for a given environment, e.g. "moustache_markt_dev".
         return f"{self.project}_{env}"
 
-    # Ścieżka plikowa do landingu, np. "/Volumes/moustache_markt_sources/landing".
-    # Volumes w UC są widoczne jak zwykłe foldery pod /Volumes/<katalog>/<schemat>/<volume>.
-    # Pod nią leżą volumes per system (erp, crm, ...) - tam symulator zapisuje pliki.
+    # File path to landing, e.g. "/Volumes/moustache_markt_sources/landing".
+    # UC volumes are visible as regular folders under /Volumes/<catalog>/<schema>/<volume>.
+    # Below it sit the per-system volumes (erp, crm, ...) - that is where the simulator writes files.
     @property
     def landing_path(self) -> str:
         return f"/Volumes/{self.sources_catalog}/{LANDING_SCHEMA}"
 
-    # Ścieżka do volume z checkpointami Auto Loadera w danym środowisku,
-    # np. "/Volumes/moustache_markt_dev/ops/checkpoints".
+    # Path to the volume holding Auto Loader checkpoints in a given environment,
+    # e.g. "/Volumes/moustache_markt_dev/ops/checkpoints".
     def checkpoints_path(self, env: str) -> str:
         return f"/Volumes/{self.env_catalog(env)}/{OPS_SCHEMA}/{CHECKPOINTS_VOLUME}"
 
 
-# Sprawdza jedną listę nazw z YAML i zamienia ją na krotkę.
-# `source` to nazwa pliku - trafia do komunikatu błędu, żeby było wiadomo, gdzie szukać.
+# Checks a single list of names from the YAML and turns it into a tuple.
+# `source` is the file name - it goes into the error message so you know where to look.
 def _name_list(raw: dict[str, Any], key: str, source: str) -> tuple[str, ...]:
-    # Wartość pod danym kluczem (obecność klucza sprawdza już wcześniej _config_from_dict).
+    # The value under the given key (presence of the key is already checked by _config_from_dict).
     value = raw[key]
-    # Musi być lista. Sam napis też by się dał iterować: "erp" dałby systemy "e", "r", "p".
+    # Must be a list. A plain string is iterable too: "erp" would yield systems "e", "r", "p".
     if not isinstance(value, list) or not value:
         raise ValueError(f"{source}: '{key}' must be a non-empty list, got {value!r}")
-    # Każdy element musi być napisem. Łapie m.in. pułapkę YAML: niecytowane `no` to False, a nie "no".
+    # Every element must be a string. Catches, among others, the YAML trap: unquoted `no` is False, not "no".
     not_strings = [item for item in value if not isinstance(item, str)]
     if not_strings:
         raise ValueError(f"{source}: '{key}' must contain only strings, got {not_strings!r}")
-    # Duplikaty to prawie na pewno pomyłka (dwa razy "erp" = dwa razy ten sam CREATE).
-    # set() usuwa powtórzenia, więc różna długość oznacza, że jakaś nazwa się powtarza.
+    # Duplicates are almost certainly a mistake ("erp" twice = the same CREATE twice).
+    # set() removes repetitions, so a different length means some name is repeated.
     if len(set(value)) != len(value):
         raise ValueError(f"{source}: '{key}' contains duplicates: {value!r}")
-    # Krotka zamiast listy - patrz komentarz przy PlatformConfig.
+    # A tuple instead of a list - see the comment on PlatformConfig.
     return tuple(value)
 
 
-# Zamienia surowy wynik parsowania YAML (dowolny typ) na zwalidowany PlatformConfig.
-# Wydzielone z load_config, żeby testy mogły podać słownik bez tworzenia pliku.
+# Turns the raw YAML parse result (any type) into a validated PlatformConfig.
+# Split out of load_config so that tests can pass a dict without creating a file.
 def _config_from_dict(raw: Any, source: str) -> PlatformConfig:
-    # Plik musi być mapą "klucz: wartość". Pusty plik daje None, sama lista daje list.
+    # The file must be a "key: value" mapping. An empty file gives None, a bare list gives list.
     if not isinstance(raw, dict):
         raise ValueError(f"{source}: expected a mapping of keys to values, got {type(raw).__name__}")
-    # Oczekiwane klucze = nazwy pól dataclassy. Dodanie pola do PlatformConfig automatycznie
-    # czyni je wymaganym w YAML - nie trzeba pamiętać o aktualizacji osobnej listy.
+    # Expected keys = the dataclass field names. Adding a field to PlatformConfig automatically
+    # makes it required in the YAML - no need to remember to update a separate list.
     expected = {field.name for field in fields(PlatformConfig)}
-    # Różnice zbiorów: klucze nadmiarowe (np. literówka "enviroments") i brakujące.
-    # str() na wypadek kluczy niebędących napisami (np. `1: x` w YAML) - inaczej sorted() by się wywalił.
+    # Set differences: extra keys (e.g. the typo "enviroments") and missing ones.
+    # str() in case of non-string keys (e.g. `1: x` in YAML) - otherwise sorted() would blow up.
     unknown = sorted(str(key) for key in raw.keys() - expected)
     missing = sorted(expected - raw.keys())
-    # Literówkę w kluczu zgłaszamy jako błąd - po cichu zignorowana dałaby trudny do znalezienia bug.
+    # A typo in a key is reported as an error - silently ignored, it would cause a hard-to-find bug.
     if unknown or missing:
         raise ValueError(f"{source}: unknown keys {unknown}, missing keys {missing}")
-    # project to pojedynczy napis, a nie lista.
+    # project is a single string, not a list.
     if not isinstance(raw["project"], str):
         raise ValueError(f"{source}: 'project' must be a string, got {raw['project']!r}")
-    # Budujemy niemutowalny obiekt. Poprawność samych nazw (snake_case) sprawdza później
-    # _identifier() w build_statements - jedno miejsce walidacji nazw zamiast dwóch.
+    # Build the immutable object. Validity of the names themselves (snake_case) is checked later
+    # by _identifier() in build_statements - one place for name validation instead of two.
     return PlatformConfig(
         project=raw["project"],
         environments=_name_list(raw, "environments", source),
@@ -152,186 +152,186 @@ def _config_from_dict(raw: Any, source: str) -> PlatformConfig:
     )
 
 
-# Publiczne API: wczytuje plik YAML i zwraca zwalidowaną konfigurację.
-# Przyjmuje str albo Path; domyślnie config/platform.yml obok tego modułu.
+# Public API: reads the YAML file and returns a validated config.
+# Accepts str or Path; defaults to config/platform.yml next to this module.
 def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> PlatformConfig:
-    """Wczytuje i waliduje konfigurację platformy z pliku YAML."""
-    # Path(...) na Path jest bezpieczne - zwraca równoważną ścieżkę.
+    """Reads and validates the platform config from a YAML file."""
+    # Path(...) on a Path is safe - it returns an equivalent path.
     path = Path(path)
-    # encoding="utf-8" jawnie: na Windows domyślne kodowanie to cp1250/cp1252 i polskie znaki
-    # w komentarzach YAML by się rozsypały. Brak pliku -> FileNotFoundError z pełną ścieżką.
+    # encoding="utf-8" explicitly: on Windows the default encoding is cp1250/cp1252 and non-ASCII
+    # characters in YAML comments would get mangled. Missing file -> FileNotFoundError with the full path.
     with path.open(encoding="utf-8") as file:
-        # safe_load, NIGDY yaml.load: zwykły load potrafi tworzyć dowolne obiekty Pythona
-        # z odpowiednio spreparowanego pliku. safe_load zwraca tylko dict/list/str/int/float/bool/None.
+        # safe_load, NEVER yaml.load: plain load can construct arbitrary Python objects
+        # from a crafted file. safe_load returns only dict/list/str/int/float/bool/None.
         raw = yaml.safe_load(file)
-    # Walidacja i budowa obiektu; nazwa pliku idzie do komunikatów błędów.
+    # Validate and build the object; the file name goes into error messages.
     return _config_from_dict(raw, source=str(path))
 
 
-# Podkreślnik na początku nazwy = funkcja "prywatna" modułu (konwencja, nie wymuszenie).
+# A leading underscore in the name = a "private" module function (a convention, not enforced).
 def _identifier(name: str) -> str:
-    """Odrzuca wszystko, co nie jest lower snake_case (literówki, myślniki, SQL injection)."""
-    # match() sprawdza dopasowanie od początku napisu; dzięki "$" w regexie - do samego końca.
-    # Zwraca None, gdy nazwa nie pasuje.
+    """Rejects anything that is not lower snake_case (typos, hyphens, SQL injection)."""
+    # match() checks for a match from the start of the string; thanks to "$" in the regex - to the very end.
+    # Returns None when the name does not match.
     if not UC_IDENTIFIER.match(name):
-        # !r wstawia repr() wartości - z cudzysłowami, więc widać np. spacje na końcu.
+        # !r inserts the repr() of the value - with quotes, so e.g. trailing spaces are visible.
         raise ValueError(f"Invalid UC identifier: {name!r}")
-    # Zwracamy tę samą nazwę, żeby dało się użyć funkcji "w locie" wewnątrz f-stringa.
+    # Return the same name so the function can be used "inline" inside an f-string.
     return name
 
 
-# Buduje DDL dla katalogu źródłowego: katalog -> schemat landing -> volume na każdy system.
+# Builds the DDL for the sources catalog: catalog -> landing schema -> one volume per system.
 def _sources_statements(config: PlatformConfig) -> list[str]:
-    # Nazwa katalogu po walidacji, np. "moustache_markt_sources".
+    # Catalog name after validation, e.g. "moustache_markt_sources".
     catalog = _identifier(config.sources_catalog)
-    # Lista startowa: najpierw rodzic (katalog), potem dziecko (schemat).
+    # Initial list: parent (catalog) first, then child (schema).
     statements = [
-        # Dwa sąsiadujące literały napisowe Python skleja w jeden (bez "+").
-        # IF NOT EXISTS -> ponowne uruchomienie nic nie psuje (idempotencja).
+        # Python concatenates two adjacent string literals into one (no "+").
+        # IF NOT EXISTS -> re-running breaks nothing (idempotency).
         f"CREATE CATALOG IF NOT EXISTS {catalog} "
         "COMMENT 'Simulated outside world. Written only by the simulator.'",
-        # Schemat "landing" w katalogu źródłowym - tu wpadają surowe pliki.
+        # The "landing" schema in the sources catalog - raw files land here.
         f"CREATE SCHEMA IF NOT EXISTS {catalog}.{LANDING_SCHEMA} "
         "COMMENT 'Raw files delivered by source systems'",
     ]
-    # += na liście dokleja elementy z drugiej listy (jak extend).
+    # += on a list appends the elements of another list (like extend).
     statements += [
-        # Volume = katalog plików w UC, ścieżka /Volumes/<catalog>/landing/<system> (= landing_path/<system>).
-        # Nazwa systemu jest walidowana, bo trafia bezpośrednio do SQL.
+        # Volume = a file directory in UC, path /Volumes/<catalog>/landing/<system> (= landing_path/<system>).
+        # The system name is validated because it goes straight into SQL.
         f"CREATE VOLUME IF NOT EXISTS {catalog}.{LANDING_SCHEMA}.{_identifier(system)} "
         f"COMMENT 'Landing zone for source system: {system}'"
-        # List comprehension - jedno polecenie na każdy system, w kolejności z konfiguracji.
+        # List comprehension - one statement per system, in config order.
         for system in config.source_systems
     ]
-    # Wynik: 2 + len(source_systems) poleceń (domyślnie 6).
+    # Result: 2 + len(source_systems) statements (6 by default).
     return statements
 
 
-# Buduje DDL dla jednego środowiska (dev albo prod).
+# Builds the DDL for a single environment (dev or prod).
 def _environment_statements(config: PlatformConfig, env: str) -> list[str]:
-    # Nazwa katalogu środowiska po walidacji, np. "moustache_markt_dev".
+    # Environment catalog name after validation, e.g. "moustache_markt_dev".
     catalog = _identifier(config.env_catalog(env))
-    # Najpierw sam katalog - wszystko poniżej jest jego dzieckiem.
+    # The catalog itself first - everything below is its child.
     statements = [
         f"CREATE CATALOG IF NOT EXISTS {catalog} COMMENT 'Data platform, environment: {env}'"
     ]
-    # Schemat bronze per system źródłowy (bronze_erp, bronze_crm, ...).
-    # Bronze jest "source-aligned": jeden schemat = jeden system, dane 1:1 ze źródła.
+    # A bronze schema per source system (bronze_erp, bronze_crm, ...).
+    # Bronze is "source-aligned": one schema = one system, data 1:1 from the source.
     statements += [
-        # Walidujemy całą sklejoną nazwę 'bronze_' + system.
+        # Validate the whole concatenated name 'bronze_' + system.
         f"CREATE SCHEMA IF NOT EXISTS {catalog}.{_identifier('bronze_' + system)} "
         f"COMMENT 'Bronze, source-aligned: {system}'"
         for system in config.source_systems
     ]
-    # Schematy warstw curated (silver, gold) - wspólne dla wszystkich systemów.
+    # Curated layer schemas (silver, gold) - shared by all systems.
     statements += [
-        # capitalize() -> "silver" zamienia na "Silver" w komentarzu.
+        # capitalize() -> turns "silver" into "Silver" in the comment.
         f"CREATE SCHEMA IF NOT EXISTS {catalog}.{_identifier(layer)} "
         f"COMMENT '{layer.capitalize()} layer'"
         for layer in config.curated_layers
     ]
-    # Schemat techniczny "ops" i volume na checkpointy (schemat przed volume - rodzic przed dzieckiem).
+    # The technical "ops" schema and a volume for checkpoints (schema before volume - parent before child).
     statements += [
         f"CREATE SCHEMA IF NOT EXISTS {catalog}.{OPS_SCHEMA} "
         "COMMENT 'Operational metadata: checkpoints, DQ results, run logs'",
-        # Auto Loader trzyma tu stan strumienia (które pliki już przeczytał) i wywnioskowany schemat.
+        # Auto Loader keeps the stream state here (which files it has already read) and the inferred schema.
         f"CREATE VOLUME IF NOT EXISTS {catalog}.{OPS_SCHEMA}.{CHECKPOINTS_VOLUME} "
         "COMMENT 'Auto Loader checkpoints and schema locations'",
     ]
-    # Wynik: 1 + len(source_systems) + len(curated_layers) + 2 poleceń (domyślnie 9).
+    # Result: 1 + len(source_systems) + len(curated_layers) + 2 statements (9 by default).
     return statements
 
 
-# Publiczne API modułu: z konfiguracji robi pełną, uporządkowaną listę poleceń SQL.
-# envs=None oznacza "wszystkie środowiska z konfiguracji".
+# The module's public API: turns the config into a complete, ordered list of SQL statements.
+# envs=None means "all environments from the config".
 def build_statements(config: PlatformConfig, envs: Sequence[str] | None = None) -> list[str]:
-    """Funkcja czysta: konfiguracja -> uporządkowany, idempotentny DDL. Rodzic zawsze przed dzieckiem."""
-    # Funkcja czysta (pure function) = brak efektów ubocznych, ten sam input -> ten sam output; łatwa do testów.
-    # Pusta lista lub None -> bierzemy wszystkie środowiska; w przeciwnym razie kopia jako krotka.
+    """Pure function: config -> ordered, idempotent DDL. Parent always before child."""
+    # Pure function = no side effects, same input -> same output; easy to test.
+    # Empty list or None -> take all environments; otherwise a copy as a tuple.
     selected_envs = tuple(envs) if envs else config.environments
-    # Różnica zbiorów: środowiska podane przez użytkownika, których nie ma w konfiguracji.
-    # sorted() daje stabilną, czytelną kolejność w komunikacie błędu.
+    # Set difference: environments given by the user that are not in the config.
+    # sorted() gives a stable, readable order in the error message.
     unknown = sorted(set(selected_envs) - set(config.environments))
-    # Niepusta lista jest "prawdziwa" -> są nieznane środowiska.
+    # A non-empty list is "truthy" -> there are unknown environments.
     if unknown:
-        # Fail fast, zanim jakikolwiek SQL zostanie wygenerowany/wykonany.
+        # Fail fast, before any SQL is generated/executed.
         raise ValueError(f"Unknown environments: {unknown}")
 
-    # Katalog źródłowy zawsze jest pierwszy i zawsze jest tworzony (także przy --envs dev).
+    # The sources catalog always comes first and is always created (also with --envs dev).
     statements = _sources_statements(config)
-    # Następnie po kolei każde wybrane środowisko, w kolejności podanej przez użytkownika.
+    # Then each selected environment in turn, in the order given by the user.
     for env in selected_envs:
         statements += _environment_statements(config, env)
-    # Domyślnie: 6 + 9 * 2 = 24 polecenia.
+    # By default: 6 + 9 * 2 = 24 statements.
     return statements
 
 
-# Wykonuje polecenia. `execute` jest wstrzykiwany (dependency injection), więc ta funkcja
-# nie wie nic o Sparku - w testach można podać np. lista.append.
+# Executes the statements. `execute` is injected (dependency injection), so this function
+# knows nothing about Spark - in tests you can pass e.g. list.append.
 def apply_statements(statements: Iterable[str], execute: Callable[[str], object]) -> int:
-    """Wykonuje polecenia po kolei. `execute` to spark.sql na Databricks, a w testach atrapa."""
-    # Licznik wykonanych poleceń - zwracany na końcu do logu podsumowującego.
+    """Executes the statements in order. `execute` is spark.sql on Databricks, and a stub in tests."""
+    # Counter of executed statements - returned at the end for the summary log.
     executed = 0
-    # Ściśle sekwencyjnie: kolejność ma znaczenie (rodzic przed dzieckiem).
+    # Strictly sequential: order matters (parent before child).
     for statement in statements:
-        # Najpierw log, potem wykonanie - jeśli polecenie się wywali, w logu widać które.
+        # Log first, then execute - if the statement fails, the log shows which one.
         logger.info(statement)
-        # Wynik (np. DataFrame ze spark.sql) jest ignorowany - DDL nic istotnego nie zwraca.
-        # Wyjątek z execute przerywa pętlę; wcześniejsze polecenia zostają wykonane,
-        # co jest bezpieczne, bo całość jest idempotentna i można po prostu puścić ponownie.
+        # The result (e.g. a DataFrame from spark.sql) is ignored - DDL returns nothing of interest.
+        # An exception from execute stops the loop; earlier statements stay executed,
+        # which is safe because everything is idempotent and you can simply run it again.
         execute(statement)
-        # Zwiększamy licznik dopiero po udanym wykonaniu.
+        # Increment the counter only after a successful execution.
         executed += 1
     return executed
 
 
-# Punkt wejścia CLI. argv=None -> argparse czyta sys.argv[1:]; w testach można podać listę.
+# CLI entry point. argv=None -> argparse reads sys.argv[1:]; in tests you can pass a list.
 def main(argv: Sequence[str] | None = None) -> None:
-    # Parser z opisem widocznym w `--help`.
+    # Parser with a description shown in `--help`.
     parser = argparse.ArgumentParser(description="Idempotent Unity Catalog bootstrap")
-    # nargs="+" -> jedna lub więcej wartości: --envs dev  albo  --envs dev prod.
-    # Brak flagi -> args.envs == None -> wszystkie środowiska.
+    # nargs="+" -> one or more values: --envs dev  or  --envs dev prod.
+    # No flag -> args.envs == None -> all environments.
     parser.add_argument("--envs", nargs="+", help="Subset of environments, e.g. --envs dev")
-    # store_true -> flaga bez wartości; obecna = True, brak = False.
-    # argparse zamienia myślnik na podkreślnik: --dry-run -> args.dry_run.
+    # store_true -> a flag without a value; present = True, absent = False.
+    # argparse turns the hyphen into an underscore: --dry-run -> args.dry_run.
     parser.add_argument("--dry-run", action="store_true", help="Print the SQL plan only")
-    # type=Path -> argparse od razu zamienia podany napis na Path.
-    # Domyślnie config/platform.yml obok tego modułu, więc w jobie flagi nie trzeba podawać.
+    # type=Path -> argparse converts the given string to a Path right away.
+    # Defaults to config/platform.yml next to this module, so a job does not need to pass the flag.
     parser.add_argument(
         "--config", type=Path, default=DEFAULT_CONFIG_PATH,
         help=f"Path to the platform YAML config (default: {DEFAULT_CONFIG_PATH.name} next to this script)",
     )
-    # Parsowanie; przy błędnych argumentach argparse sam wypisze błąd i zakończy (exit code 2).
+    # Parsing; on invalid arguments argparse prints the error itself and exits (exit code 2).
     args = parser.parse_args(argv)
 
-    # Wczytanie i walidacja YAML - błędny plik zatrzymuje skrypt, zanim powstanie jakikolwiek SQL.
+    # Load and validate the YAML - a broken file stops the script before any SQL is built.
     config = load_config(args.config)
-    # Plan SQL budowany zawsze, także w trybie dry-run - więc walidacja (nazwy, środowiska)
-    # działa lokalnie, bez Sparka.
+    # The SQL plan is always built, also in dry-run mode - so validation (names, environments)
+    # works locally, without Spark.
     statements = build_statements(config, args.envs)
-    # Tryb "na sucho": tylko wypisz plan i wyjdź.
+    # "Dry" mode: just print the plan and exit.
     if args.dry_run:
-        # Jedno polecenie na linię, na stdout (print, nie logger - bez timestampów, łatwo przekierować do pliku).
+        # One statement per line, to stdout (print, not logger - no timestamps, easy to redirect to a file).
         print("\n".join(statements))
-        # Wyjście przed importem pyspark - dry-run działa bez zainstalowanego Sparka.
+        # Exit before importing pyspark - dry-run works without Spark installed.
         return
 
-    # Konfiguracja logowania dopiero w trybie wykonania: poziom INFO, format z czasem i poziomem.
-    # force=True usuwa wcześniej podpięte handlery (Databricks/IPython często już jakieś ma),
-    # inaczej basicConfig byłby po cichu zignorowany i logi by się nie pokazały.
+    # Logging is configured only in execution mode: INFO level, format with time and level.
+    # force=True removes previously attached handlers (Databricks/IPython often already has some),
+    # otherwise basicConfig would be silently ignored and the logs would not show up.
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
-    from pyspark.sql import SparkSession  # leniwy import: dry-run i testy jednostkowe nie potrzebują Sparka
+    from pyspark.sql import SparkSession  # lazy import: dry-run and unit tests do not need Spark
 
-    # Na Databricks zwraca istniejącą sesję (notebook/job już ją ma); lokalnie przez
-    # Databricks Connect / rozszerzenie VS Code - sesję zdalną.
+    # On Databricks returns the existing session (the notebook/job already has one); locally via
+    # Databricks Connect / the VS Code extension - a remote session.
     spark = SparkSession.builder.getOrCreate()
-    # Przekazujemy metodę spark.sql (bez wywołania!) jako funkcję wykonującą.
+    # Pass the spark.sql method (without calling it!) as the executing function.
     executed = apply_statements(statements, spark.sql)
-    # Podsumowanie; %d + argument zamiast f-stringa - formatowanie leniwe, robione tylko gdy log jest emitowany.
+    # Summary; %d + argument instead of an f-string - lazy formatting, done only when the log is emitted.
     logger.info("Done: %d statements executed", executed)
 
 
-# Ten blok wykonuje się tylko przy uruchomieniu pliku jako skryptu (python uc_bootstrap.py),
-# a nie przy imporcie (np. `from uc_bootstrap import build_statements` w testach).
+# This block runs only when the file is executed as a script (python uc_bootstrap.py),
+# not on import (e.g. `from uc_bootstrap import build_statements` in tests).
 if __name__ == "__main__":
     main()

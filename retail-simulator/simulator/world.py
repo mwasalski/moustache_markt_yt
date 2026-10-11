@@ -7,6 +7,7 @@ That is why any single day can be regenerated without generating the days before
 from __future__ import annotations
 
 import random
+import unicodedata
 from bisect import bisect_left
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
@@ -15,14 +16,13 @@ from decimal import ROUND_HALF_UP, Decimal
 from itertools import accumulate
 
 from . import reference_data as ref
-from .calendar_pl import ONLINE_HOURS, demand_multiplier, is_black_week, is_trading_day, local_to_utc, sample_local_time
+from .calendar_us import ONLINE_HOURS, demand_multiplier, is_black_week, is_trading_day, local_to_utc, sample_local_time
 from .config import SimulationConfig
 from .formats import UTC
 from .rng import Weighted, make_rng, pick_weighted, poisson, uuid_from
 
 CENT = Decimal("0.01")
 ZERO = Decimal("0.00")
-VAT_RATE = Decimal("0.23")
 DAY_CONTEXT_CACHE_SIZE = 48
 APP_LAUNCH = date(2019, 3, 1)
 CUSTOMERS_SINCE = datetime(2016, 1, 1, tzinfo=UTC)
@@ -33,8 +33,6 @@ EMAIL_DOMAIN_PICKER = Weighted(ref.EMAIL_DOMAINS)
 REGISTRATION_CHANNELS = Weighted([("WEB", 0.6), ("APP", 0.25), ("STORE", 0.15)])
 PHONE_STYLES = Weighted([(1, 0.4), (0, 0.3), (2, 0.15), (4, 0.1), (3, 0.05)])
 CHANGE_KINDS = Weighted([("EMAIL", 0.25), ("PHONE", 0.15), ("ADDRESS", 0.15), ("CONSENT", 0.25), ("LOYALTY", 0.2)])
-ENERGY_CLASSES = ("C", "D", "E", "E", "F", "F", "G")
-TRANSLITERATION = str.maketrans("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ", "acelnoszzACELNOSZZ")
 PII_FIELDS = ("first_name", "last_name", "company_name", "tax_id", "email", "phone_digits", "birth_date",
               "postal_code", "loyalty_card_no")
 
@@ -47,13 +45,18 @@ def money(value: float | Decimal) -> Decimal:
     return Decimal(str(value)).quantize(CENT, rounding=ROUND_HALF_UP)
 
 
+def sales_tax_rate(state: str) -> Decimal:
+    return Decimal(str(ref.SALES_TAX_RATES[state]))
+
+
+HOME_STATE_TAX_RATE = sales_tax_rate(ref.HOME_STATE)
+
+
 def retail_round(value: float) -> Decimal:
-    """Polish shelf prices: 1 299,99 / 49,99."""
+    """US shelf prices: $1,299.99 / $49.99."""
     if value >= 100:
         return Decimal(int(value // 10) * 10) - CENT
-    if value >= 10:
-        return Decimal(int(value)) - CENT
-    return Decimal(f"{max(value, 0.99):.2f}")
+    return Decimal(max(int(value), 1)) - CENT
 
 
 def ean13(first12: str) -> str:
@@ -61,22 +64,22 @@ def ean13(first12: str) -> str:
     return first12 + str((10 - total % 10) % 10)
 
 
-NIP_WEIGHTS = (6, 5, 7, 2, 3, 4, 5, 6, 7)
+INVALID_EIN_PREFIXES = ("00", "07", "08", "09", "17", "18", "19", "28", "29", "49", "69", "70", "78", "79",
+                        "89", "96", "97")  # never assigned by the IRS
+VALID_EIN_PREFIXES = tuple(f"{p:02d}" for p in range(1, 100) if f"{p:02d}" not in INVALID_EIN_PREFIXES)
 
 
-def is_valid_nip(nip: str) -> bool:
-    if len(nip) != 10 or not nip.isdigit():
-        return False
-    check = sum(int(d) * w for d, w in zip(nip, NIP_WEIGHTS)) % 11
-    return check == int(nip[-1])
+def is_valid_ein(ein: str) -> bool:
+    return (len(ein) == 10 and ein[2] == "-" and ein.replace("-", "").isdigit()
+            and ein[:2] in VALID_EIN_PREFIXES)
 
 
-def _nip(rng: random.Random) -> str:
-    while True:
-        digits = [rng.randint(1, 9)] + [rng.randrange(10) for _ in range(8)]
-        check = sum(d * w for d, w in zip(digits, NIP_WEIGHTS)) % 11
-        if check < 10:
-            return "".join(map(str, digits)) + str(check)
+def _ein(rng: random.Random) -> str:
+    return f"{rng.choice(VALID_EIN_PREFIXES)}-{rng.randrange(10**7):07d}"
+
+
+def zip_code(rng: random.Random, city: ref.City) -> str:
+    return f"{city.zip_prefix}{rng.randrange(100):02d}"
 
 
 def loyalty_card_number(customer_index: int) -> str:
@@ -134,11 +137,11 @@ class Product:
     brand_name: str  # as typed into the ERP - sometimes a dirty variant
     leaf_code: str
     category_id: int
-    base_price: float  # gross PLN at launch
+    base_price: float  # USD at launch, before sales tax
     cost_ratio: float  # net cost / net price
-    weight_kg: Decimal
+    weight_lb: Decimal
     warranty_months: int
-    energy_class: str | None
+    energy_star: bool | None
     launch_date: date
     eol_date: date | None
     popularity: float
@@ -181,7 +184,7 @@ class Product:
         if day < self.launch_date:
             return None
         month_start = max(day.replace(day=1), self.launch_date)
-        return money(self.base_price * self._age_factor(month_start) / 1.23 * self.cost_ratio)
+        return money(self.base_price * self._age_factor(month_start) * self.cost_ratio)
 
     def cost_changed_at(self, day: date) -> datetime:
         month_start = day.replace(day=1)
@@ -197,7 +200,7 @@ def _launch_date(rng: random.Random) -> date:
 
 
 def _unique_ean(rng: random.Random, brand: str, used: set[str]) -> str:
-    prefix = ref.EAN_PREFIXES.get(brand, "590")
+    prefix = ref.EAN_PREFIXES.get(brand, "086")
     while True:
         ean = ean13(prefix + "".join(str(rng.randrange(10)) for _ in range(12 - len(prefix))))
         if ean not in used:
@@ -225,7 +228,7 @@ def build_products(config: SimulationConfig, categories: list[Category]) -> list
         rng = make_rng(config.seed, "product", index)
         leaf = leaves(rng)
         brand, models = rng.choice(leaf.models)
-        name = f"{leaf.product_type} {brand} {rng.choice(models)} {rng.choice(leaf.specs)}"
+        name = f"{brand} {rng.choice(models)} {leaf.product_type} {rng.choice(leaf.specs)}"
         launch = _launch_date(rng)
         eol = launch + timedelta(days=rng.randint(540, 1460))
         products.append(Product(
@@ -238,14 +241,14 @@ def build_products(config: SimulationConfig, categories: list[Category]) -> list
             category_id=leaf_ids[leaf.code],
             base_price=leaf.median_price * rng.lognormvariate(0, 0.25),
             cost_ratio=rng.uniform(0.72, 0.9),
-            weight_kg=Decimal(f"{rng.uniform(*leaf.weight_kg):.3f}"),
+            weight_lb=Decimal(f"{rng.uniform(*leaf.weight_lb):.3f}"),
             warranty_months=leaf.warranty_months,
-            energy_class=rng.choice(ENERGY_CLASSES) if leaf.energy_label else None,
+            energy_star=rng.random() < 0.6 if leaf.energy_label else None,
             launch_date=launch,
             eol_date=eol if eol <= config.world_end else None,
-            popularity=(1.0 / ranks[index] ** 1.05) * (1000.0 / (leaf.median_price + 300.0)) ** 0.5,
+            popularity=(1.0 / ranks[index] ** 1.05) * (250.0 / (leaf.median_price + 75.0)) ** 0.5,
             in_store_assortment=rng.random() < leaf.store_share,
-            is_accessory=leaf.median_price < 300,
+            is_accessory=leaf.median_price < 75,
             return_factor=leaf.return_factor,
             promo_years=frozenset(year for year in range(2022, 2028) if rng.random() < 0.3),
         ))
@@ -263,11 +266,11 @@ class Location:
     location_type: str  # STORE | DC | ONLINE
     store_format: str | None
     city: str | None
-    voivodeship: str | None
+    state: str | None
     postal_code: str | None
     latitude: Decimal | None
     longitude: Decimal | None
-    floor_area_m2: int | None
+    floor_area_sqft: int | None
     opened_date: date
     closed_date: date | None
     registers: int = 0
@@ -283,23 +286,22 @@ class Location:
 
 
 _REGISTERS = {"FLAGSHIP": 6, "STANDARD": 4, "OUTLET": 3}
-_FLOOR_AREA = {"FLAGSHIP": (1200, 1800), "STANDARD": (400, 800), "OUTLET": (550, 650)}
+_FLOOR_AREA = {"FLAGSHIP": (25_000, 40_000), "STANDARD": (12_000, 20_000), "OUTLET": (8_000, 10_000)}
 _TRAFFIC = {"FLAGSHIP": 1.6, "STANDARD": 1.0, "OUTLET": 0.7}
 
 
 def build_locations(config: SimulationConfig) -> list[Location]:
-    cities = {city.name: city for city in ref.CITIES}
     locations = []
     for location_id, spec in enumerate(ref.STORES, start=1):
         rng = make_rng(config.seed, "location", spec.code)
-        city = cities[spec.city]
+        city = ref.CITY_BY_NAME[spec.city]
         registers = _REGISTERS[spec.store_format]
-        cashiers = {f"K{rng.randrange(1000, 10_000)}" for _ in range(registers * 2 + 2)}
+        cashiers = {f"C{rng.randrange(1000, 10_000)}" for _ in range(registers * 2 + 2)}
         if spec.code == ref.FRAUD_STORE:
             cashiers.add(ref.FRAUD_CASHIER)
         locations.append(Location(
-            location_id, spec.code, spec.name, "STORE", spec.store_format, city.name, city.voivodeship,
-            f"{city.postal_prefix}-{rng.randrange(1000):03d}",
+            location_id, spec.code, spec.name, "STORE", spec.store_format, city.name, city.state,
+            zip_code(rng, city),
             Decimal(f"{city.latitude + rng.uniform(-0.03, 0.03):.6f}"),
             Decimal(f"{city.longitude + rng.uniform(-0.03, 0.03):.6f}"),
             rng.randint(*_FLOOR_AREA[spec.store_format]), spec.opened, spec.closed, registers,
@@ -307,10 +309,10 @@ def build_locations(config: SimulationConfig) -> list[Location]:
         ))
     for location_id, site in enumerate(ref.DISTRIBUTION_CENTERS, start=len(ref.STORES) + 1):
         locations.append(Location(
-            location_id, site.code, site.name, "DC", None, site.city, site.voivodeship, site.postal_code,
+            location_id, site.code, site.name, "DC", None, site.city, site.state, site.postal_code,
             Decimal(f"{site.latitude:.6f}"), Decimal(f"{site.longitude:.6f}"), None, site.opened, None,
         ))
-    locations.append(Location(ref.ONLINE_LOCATION_ID, "ONLINE", "Sklep internetowy", "ONLINE",
+    locations.append(Location(ref.ONLINE_LOCATION_ID, "ONLINE", "Online Store", "ONLINE",
                               None, None, None, None, None, None, None, date(2014, 1, 1), None))
     return locations
 
@@ -349,8 +351,14 @@ class Customer:
     end_at: datetime | None  # erasure (GDPR) or account deletion: no activity afterwards
 
 
+def _ascii(name: str) -> str:
+    """'José' -> 'jose', "O'Brien" -> 'obrien'."""
+    decomposed = unicodedata.normalize("NFKD", name)
+    return "".join(char for char in decomposed if char.isascii() and char.isalnum()).lower()
+
+
 def make_email(rng: random.Random, first: str, last: str, dirty_rate: float) -> str:
-    first_ascii, last_ascii = first.translate(TRANSLITERATION).lower(), last.translate(TRANSLITERATION).lower()
+    first_ascii, last_ascii = _ascii(first), _ascii(last)
     pattern, number, domain = rng.randrange(4), rng.randint(1, 99), EMAIL_DOMAIN_PICKER(rng)
     local = (f"{first_ascii}.{last_ascii}", f"{first_ascii}{last_ascii}{number}",
              f"{first_ascii[0]}{last_ascii}", f"{last_ascii}.{first_ascii}{number}")[pattern]
@@ -362,7 +370,8 @@ def make_email(rng: random.Random, first: str, last: str, dirty_rate: float) -> 
 
 
 def random_phone(rng: random.Random) -> str:
-    return rng.choice("5678") + "".join(str(rng.randrange(10)) for _ in range(8))
+    """Ten digits: area code + exchange (never starts with 0 or 1) + line number."""
+    return rng.choice(ref.AREA_CODES) + str(rng.randint(2, 9)) + "".join(str(rng.randrange(10)) for _ in range(6))
 
 
 def _registration_moments(config: SimulationConfig) -> list[datetime]:
@@ -406,18 +415,17 @@ def _make_customer(config: SimulationConfig, index: int, registered_at: datetime
     is_b2b = rng.random() < 0.08
     male = rng.random() < 0.5
     first = rng.choice(ref.MALE_FIRST_NAMES if male else ref.FEMALE_FIRST_NAMES)
-    surname_male, surname_female = rng.choice(ref.SURNAMES)
-    last = surname_male if male else surname_female
+    last = rng.choice(ref.SURNAMES)
     city = CITY_PICKER(rng)
-    postal_code = f"{city.postal_prefix}-{rng.randrange(1000):03d}"
+    postal_code = zip_code(rng, city)
     email = make_email(rng, first, last, config.chaos.dirty_value_rate)
     phone, phone_style = random_phone(rng), PHONE_STYLES(rng)
     company = tax_id = birth_date = None
     if is_b2b:
-        company = f"{rng.choice(ref.COMPANY_WORDS)} {surname_male} {rng.choice(ref.COMPANY_FORMS)}".strip()
-        tax_id = _nip(rng)
-        if rng.random() < config.chaos.dirty_value_rate:  # typo: checksum no longer valid
-            tax_id = tax_id[:-1] + str((int(tax_id[-1]) + 1) % 10)
+        company = f"{last} {rng.choice(ref.COMPANY_WORDS)} {rng.choice(ref.COMPANY_FORMS)}".strip()
+        tax_id = _ein(rng)
+        if rng.random() < config.chaos.dirty_value_rate:  # typo: a prefix the IRS never assigns
+            tax_id = rng.choice(INVALID_EIN_PREFIXES) + tax_id[2:]
     else:
         birth_date = registered_at.date() - timedelta(days=rng.randint(18 * 365, 75 * 365))
     channel = REGISTRATION_CHANNELS(rng)
@@ -462,7 +470,7 @@ def apply_change(state: dict, customer: Customer, change_index: int, config: Sim
         new["phone_digits"], new["phone_style"] = random_phone(rng), PHONE_STYLES(rng)
     elif kind == "ADDRESS":
         city = CITY_PICKER(rng)
-        new["city"], new["postal_code"] = city.name, f"{city.postal_prefix}-{rng.randrange(1000):03d}"
+        new["city"], new["postal_code"] = city.name, zip_code(rng, city)
     elif kind == "CONSENT":
         new["marketing_consent"] = not new["marketing_consent"]
     elif kind == "LOYALTY" and new["customer_type"] == "B2C":

@@ -18,12 +18,12 @@ def epoch_millis(moment: datetime) -> int:
     return (moment - EPOCH) // timedelta(milliseconds=1)
 
 
-def pl_amount(value: Decimal) -> str:
-    """Decimal('1299.99') -> '1 299,99' (Polish locale: space as thousands separator, decimal comma)."""
-    return f"{value:,.2f}".replace(",", " ").replace(".", ",")
+def us_amount(value: Decimal) -> str:
+    """Decimal('1299.99') -> '1,299.99' (US locale: comma as thousands separator)."""
+    return f"{value:,.2f}"
 
 
 def format_phone(digits: str, style: int) -> str:
     """The same number typed five ways, as people do in free-text CRM fields."""
     a, b, c = digits[:3], digits[3:6], digits[6:]
-    return (f"+48 {a} {b} {c}", digits, f"{a}-{b}-{c}", f"0048{digits}", f"+48{digits}")[style]
+    return (f"+1 {a} {b} {c}", digits, f"({a}) {b}-{c}", f"1-{a}-{b}-{c}", f"+1{digits}")[style]

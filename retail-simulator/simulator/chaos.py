@@ -7,15 +7,15 @@ from collections.abc import Iterator
 from decimal import Decimal
 
 from .config import SimulationConfig
-from .formats import pl_amount
+from .formats import us_amount
 from .rng import make_rng
 
-_CORRUPTED_AMOUNTS = ("$ {dot}", "{pl} zł", "PLN {dot}", "N/A", "", "{dot} ")
+_CORRUPTED_AMOUNTS = ("$ {dot}", "${us}", "USD {dot}", "N/A", "", "{dot} ")
 
 
 def corrupt_amount(value: Decimal, rng: random.Random) -> str:
-    """A number that arrives as text: '$ 123.45', '1 299,99 zł', 'N/A', ''..."""
-    return rng.choice(_CORRUPTED_AMOUNTS).format(dot=f"{value:.2f}", pl=pl_amount(value))
+    """A number that arrives as text: '$ 123.45', '$1,299.99', 'N/A', ''..."""
+    return rng.choice(_CORRUPTED_AMOUNTS).format(dot=f"{value:.2f}", us=us_amount(value))
 
 
 def lateness(config: SimulationConfig, system: str, key: str) -> int:

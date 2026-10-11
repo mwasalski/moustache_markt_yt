@@ -2,7 +2,8 @@
 
 v1: one JSON array per day (an API dump - needs multiLine=true), ISO-8601 timestamps.
 v2: JSON Lines (multiLine=true would now read only the first order!), epoch-millis timestamps,
-    nested item price, new seller_id, channel MARKETPLACE renamed to ALLEGRO, fee_gross -> fee.
+    nested item price, new seller_id, channel MARKETPLACE renamed to AMAZON, shipping_fee -> fee.
+Amounts are before sales tax; tax_amount is charged at the delivery (or pickup) state's rate.
 Each export is "changed since the last run": per UTC day, only the latest version of an order.
 """
 
@@ -14,29 +15,31 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
-from .calendar_pl import ONLINE_HOURS, demand_multiplier, is_black_week, local_to_utc, sample_local_time
+from .calendar_us import ONLINE_HOURS, demand_multiplier, is_black_week, local_to_utc, sample_local_time
 from .chaos import corrupt_numbers, lateness, with_duplicates
 from .formats import epoch_millis, iso_utc
+from . import reference_data as ref
 from .rng import Weighted, make_rng, pick_weighted, poisson
-from .world import CENT, CITY_PICKER, ZERO, Customer, DayContext, Location, Product, World
+from .world import (CENT, CITY_PICKER, ZERO, Customer, DayContext, Location, Product, World, sales_tax_rate,
+                    zip_code)
 from .writers import OutputFile
 
 LOOKBACK_DAYS = 30  # longest order lifecycle (payment, shipping, 14-day return) plus late delivery
 MAX_DELAY_DAYS = 2
-FREE_DELIVERY_FROM = Decimal("299.00")
+FREE_SHIPPING_FROM = Decimal("35.00")
 
 CHANNELS = Weighted([("WEB", 0.62), ("APP", 0.28), ("MARKETPLACE", 0.10)])
 LINE_COUNTS = Weighted([(1, 0.68), (2, 0.2), (3, 0.08), (4, 0.03), (5, 0.01)])
-PAYMENTS = Weighted([("BLIK", 0.36), ("CARD", 0.24), ("TRANSFER", 0.12), ("INSTALLMENTS", 0.10),
-                     ("PAY_LATER", 0.10), ("COD", 0.08)])
-DELIVERIES = Weighted([("PARCEL_LOCKER", 0.52), ("COURIER", 0.30), ("STORE_PICKUP", 0.18)])
+PAYMENTS = Weighted([("CARD", 0.44), ("PAYPAL", 0.24), ("APPLE_PAY", 0.08), ("INSTALLMENTS", 0.10),
+                     ("PAY_LATER", 0.10), ("BANK_TRANSFER", 0.04)])
+DELIVERIES = Weighted([("STANDARD", 0.62), ("EXPRESS", 0.20), ("STORE_PICKUP", 0.18)])
 PROMO_RATES = (Decimal("0.05"), Decimal("0.10"), Decimal("0.15"))
-GUEST_NAMES = ("kontakt", "zakupy", "gracz", "tomek", "kasia", "biuro", "ania", "marek")
-GUEST_DOMAINS = ("gmail.com", "wp.pl", "onet.pl", "o2.pl", "interia.pl")
+GUEST_NAMES = ("contact", "shopping", "gamer", "mike", "jenny", "office", "alex", "chris")
+GUEST_DOMAINS = ("gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "aol.com")
 CORRUPTIBLE = {
-    "v1": (("total_gross",), ("delivery", "fee_gross"), ("items", "*", "unit_price_gross"),
-           ("items", "*", "discount_gross")),
-    "v2": (("total_gross",), ("delivery", "fee"), ("items", "*", "price", "gross"),
+    "v1": (("order_total",), ("tax_amount",), ("delivery", "shipping_fee"), ("items", "*", "unit_price"),
+           ("items", "*", "discount")),
+    "v2": (("order_total",), ("tax_amount",), ("delivery", "fee"), ("items", "*", "price", "amount"),
            ("items", "*", "price", "discount")),
 }
 
@@ -74,7 +77,8 @@ class Order:
     delivery_postal_code: str
     delivery_city: str
     fee: Decimal
-    total: Decimal  # header total: may differ from SUM(lines) by a cent (discount allocation)
+    tax: Decimal
+    total: Decimal  # header total incl. tax: lines may not reconcile to the cent (discount allocation)
     lines: tuple[OrderLine, ...]
     versions: tuple[OrderVersion, ...]
 
@@ -90,7 +94,7 @@ class Order:
 
 
 def generate_orders(world: World, created_day: date) -> list[Order]:
-    """All orders placed on a local (Europe/Warsaw) day. Pure function of (config, day)."""
+    """All orders placed on a local (America/New_York) day. Pure function of (config, day)."""
     config = world.config
     context = world.day_context(created_day)
     if not context.online:
@@ -105,14 +109,14 @@ def _order(world: World, context: DayContext, rng: random.Random, day: date, seq
     channel = CHANNELS(rng)
     created_at = local_to_utc(sample_local_time(rng, day, ONLINE_HOURS))
     if channel == "MARKETPLACE":
-        order_id = f"ALG-{rng.getrandbits(40):010x}"
+        order_id = f"AMZ-{rng.getrandbits(40):010x}"
     else:
         sequence[channel] += 1
         order_id = f"{channel}-{day:%y%m%d}-{sequence[channel]:05d}"
 
     customer, guest_email = None, None
     if channel == "MARKETPLACE":
-        guest_email = f"{rng.getrandbits(48):012x}@allegromail.pl"  # marketplaces mask buyer e-mails
+        guest_email = f"{rng.getrandbits(48):012x}@marketplace.amazon.com"  # marketplaces mask buyer e-mails
     elif channel == "WEB" and rng.random() < 0.25:
         guest_email = _guest_email(rng)
     else:
@@ -131,28 +135,28 @@ def _order(world: World, context: DayContext, rng: random.Random, day: date, seq
     )
 
     payment = PAYMENTS(rng)
-    if payment == "INSTALLMENTS" and subtotal < 500:
-        payment = "BLIK"
-    if payment == "PAY_LATER" and subtotal > 4000:
+    if payment == "INSTALLMENTS" and subtotal < 150:
         payment = "CARD"
-    delivery = "COURIER" if payment == "COD" else DELIVERIES(rng)
-    pickup_location_id = None
-    if delivery == "STORE_PICKUP":
-        store = _pickup_store(world, rng, customer, day)
-        if store is None:
-            delivery = "PARCEL_LOCKER"
-        else:
-            pickup_location_id = store.location_id
+    if payment == "PAY_LATER" and subtotal > 1000:
+        payment = "CARD"
+    delivery = DELIVERIES(rng)
+    store = _pickup_store(world, rng, customer, day) if delivery == "STORE_PICKUP" else None
+    if delivery == "STORE_PICKUP" and store is None:
+        delivery = "STANDARD"
     if customer is not None:
         city, postal_code = customer.city, customer.postal_code
     else:
         city_spec = CITY_PICKER(rng)
-        city, postal_code = city_spec.name, f"{city_spec.postal_prefix}-{rng.randrange(1000):03d}"
-    fee = _delivery_fee(delivery, payment, subtotal - header_discount)
+        city, postal_code = city_spec.name, zip_code(rng, city_spec)
+    goods = subtotal - header_discount
+    fee = _shipping_fee(delivery, goods)
+    tax_state = store.state if store is not None else ref.CITY_BY_NAME[city].state
+    tax = (goods * sales_tax_rate(tax_state)).quantize(CENT, ROUND_HALF_UP)  # shipping is not taxed
     return_factor = sum(line.product.return_factor for line in lines) / len(lines)
     versions = _lifecycle(rng, created_at, payment, delivery, return_factor)
     return Order(order_id, channel, customer, guest_email, is_b2b, created_at, voucher_code, payment, delivery,
-                 pickup_location_id, postal_code, city, fee, subtotal - header_discount + fee, lines, versions)
+                 store.location_id if store else None, postal_code, city, fee, tax, goods + fee + tax, lines,
+                 versions)
 
 
 def _draft_lines(rng: random.Random, context: DayContext) -> list[tuple[Product, int, Decimal, Decimal, bool]]:
@@ -168,7 +172,7 @@ def _draft_lines(rng: random.Random, context: DayContext) -> list[tuple[Product,
         unit = context.price(product, "ONLINE")
         promo = ((unit * quantity * rng.choice(PROMO_RATES)).quantize(CENT, ROUND_HALF_UP)
                  if rng.random() < 0.06 else ZERO)
-        warranty = unit >= 1000 and rng.random() < 0.12
+        warranty = unit >= 250 and rng.random() < 0.12
         drafts.append((product, quantity, unit, promo, warranty))
     return drafts
 
@@ -185,11 +189,11 @@ def _voucher(rng: random.Random, day: date, channel: str, subtotal: Decimal) -> 
         return None, ZERO
     if is_black_week(day):
         return "BLACK15", (subtotal * Decimal("0.15")).quantize(CENT, ROUND_HALF_UP)
-    if day.month == 12 and subtotal >= 500:
-        return "XMAS50", Decimal("50.00")
+    if day.month == 12 and subtotal >= 150:
+        return "HOLIDAY15", Decimal("15.00")
     if channel == "APP":
-        return "APKA5", (subtotal * Decimal("0.05")).quantize(CENT, ROUND_HALF_UP)
-    return "WITAJ10", (subtotal * Decimal("0.10")).quantize(CENT, ROUND_HALF_UP)
+        return "APP5", (subtotal * Decimal("0.05")).quantize(CENT, ROUND_HALF_UP)
+    return "WELCOME10", (subtotal * Decimal("0.10")).quantize(CENT, ROUND_HALF_UP)
 
 
 def _pickup_store(world: World, rng: random.Random, customer: Customer | None, day: date) -> Location | None:
@@ -203,11 +207,12 @@ def _pickup_store(world: World, rng: random.Random, customer: Customer | None, d
     return rng.choice(open_stores)
 
 
-def _delivery_fee(delivery: str, payment: str, amount: Decimal) -> Decimal:
+def _shipping_fee(delivery: str, amount: Decimal) -> Decimal:
     if delivery == "STORE_PICKUP":
         return ZERO
-    base = ZERO if amount >= FREE_DELIVERY_FROM else (Decimal("9.99") if delivery == "PARCEL_LOCKER" else Decimal("15.99"))
-    return base + (Decimal("5.00") if payment == "COD" else ZERO)
+    if delivery == "EXPRESS":
+        return Decimal("14.99")
+    return ZERO if amount >= FREE_SHIPPING_FROM else Decimal("5.99")
 
 
 def _guest_email(rng: random.Random) -> str:
@@ -224,33 +229,28 @@ def _lifecycle(rng: random.Random, created_at: datetime, payment: str, delivery:
 
     versions = [OrderVersion(created_at, "CREATED", "PENDING", None)]
     failure_roll = rng.random()
-    if payment in ("BLIK", "CARD"):
-        failed, pay_delay, cancel_delay = failure_roll < 0.03, minutes(1, 12), minutes(5, 30)
-    elif payment == "TRANSFER":  # unpaid transfers are cancelled after three days
+    if payment == "BANK_TRANSFER":  # unpaid ACH transfers are cancelled after three days
         failed, pay_delay, cancel_delay = failure_roll < 0.12, hours(1, 48), hours(72, 75)
     elif payment == "INSTALLMENTS":  # credit decision
         failed, pay_delay, cancel_delay = failure_roll < 0.15, hours(1, 20), hours(2, 24)
     elif payment == "PAY_LATER":
         failed, pay_delay, cancel_delay = failure_roll < 0.06, minutes(1, 5), minutes(5, 30)
-    else:  # COD: the courier collects the money
-        failed, pay_delay, cancel_delay = False, None, None
+    else:  # CARD, PAYPAL, APPLE_PAY
+        failed, pay_delay, cancel_delay = failure_roll < 0.03, minutes(1, 12), minutes(5, 30)
     if failed:
         versions.append(OrderVersion(created_at + cancel_delay, "CANCELLED", "FAILED", None))
         return tuple(versions)
 
-    paid_at = created_at + pay_delay if pay_delay is not None else None
-    if paid_at is not None:
-        versions.append(OrderVersion(paid_at, "PAID", "PAID", paid_at))
-    ready_at = paid_at or created_at
+    paid_at = created_at + pay_delay
+    versions.append(OrderVersion(paid_at, "PAID", "PAID", paid_at))
     if rng.random() < 0.02:  # customer cancels before shipping
-        refund_status = "REFUNDED" if paid_at else "CANCELLED"
-        versions.append(OrderVersion(ready_at + hours(1, 10), "CANCELLED", refund_status, paid_at))
+        versions.append(OrderVersion(paid_at + hours(1, 10), "CANCELLED", "REFUNDED", paid_at))
         return tuple(versions)
 
-    shipped_at = ready_at + hours(2, 30)
-    versions.append(OrderVersion(shipped_at, "SHIPPED", "PAID" if paid_at else "PENDING", paid_at))
-    delivered_at = shipped_at + hours(18, 72) + (hours(0, 72) if delivery == "STORE_PICKUP" else timedelta())
-    paid_at = paid_at or delivered_at
+    shipped_at = paid_at + hours(2, 30)
+    versions.append(OrderVersion(shipped_at, "SHIPPED", "PAID", paid_at))
+    transit = hours(10, 30) if delivery == "EXPRESS" else hours(18, 72)
+    delivered_at = shipped_at + transit + (hours(0, 72) if delivery == "STORE_PICKUP" else timedelta())
     versions.append(OrderVersion(delivered_at, "DELIVERED", "PAID", paid_at))
     return_probability = 0.045 * return_factor * (2.0 if payment == "PAY_LATER" else 1.0)  # planted truth
     if rng.random() < return_probability:
@@ -283,8 +283,8 @@ def ecom_files(world: World, day: date, version: str, cache: OrderCache) -> list
     config = world.config
     first_export_day = max(day - timedelta(days=MAX_DELAY_DAYS), config.history_start)
     picked = []
-    # local day + 1 is included: an order placed at 00:30 in Warsaw happened "yesterday" in UTC
-    for offset in range(-LOOKBACK_DAYS, 2):
+    # local day - 1 matters too: an order placed at 21:30 in New York already belongs to the next UTC day
+    for offset in range(-LOOKBACK_DAYS, 1):
         for order in cache.orders_created_on(day + timedelta(days=offset)):
             for export_day, index in order.export_versions().items():
                 if not first_export_day <= export_day <= day:
@@ -310,15 +310,16 @@ def _serialize(world: World, order: Order, index: int, version: str) -> dict:
     stamp = epoch_millis if v2 else iso_utc
     return {
         "order_id": order.order_id,
-        "channel": "ALLEGRO" if v2 and order.channel == "MARKETPLACE" else order.channel,
+        "channel": "AMAZON" if v2 and order.channel == "MARKETPLACE" else order.channel,
         "customer_id": order.customer.customer_id if order.customer else None,
         "guest_email": order.guest_email,
         "is_b2b": order.is_b2b,
         "order_status": current.status,
         "created_at": stamp(order.created_at),
         "updated_at": stamp(current.at),
-        "currency_code": "PLN",
-        "total_gross": order.total,
+        "currency_code": "USD",
+        "order_total": order.total,
+        "tax_amount": order.tax,
         "voucher_code": order.voucher_code,
         "payment": {
             "method": order.payment_method,
@@ -330,7 +331,7 @@ def _serialize(world: World, order: Order, index: int, version: str) -> dict:
             "pickup_location_id": order.pickup_location_id,
             "postal_code": order.delivery_postal_code,
             "city": order.delivery_city,
-            ("fee" if v2 else "fee_gross"): order.fee,
+            ("fee" if v2 else "shipping_fee"): order.fee,
         },
         "items": [_serialize_line(world, order, line, v2) for line in order.lines],
     }
@@ -340,14 +341,14 @@ def _serialize_line(world: World, order: Order, line: OrderLine, v2: bool) -> di
     if not v2:
         return {
             "line_no": line.line_no, "sku": line.product.sku, "quantity": line.quantity,
-            "unit_price_gross": line.unit_price, "discount_gross": line.discount,
+            "unit_price": line.unit_price, "discount": line.discount,
             "extended_warranty": line.extended_warranty,
         }
     rng = make_rng(world.config.seed, "ecom-v2-seller", order.order_id, line.line_no)
     roll, seller_number = rng.random(), rng.randrange(10_000, 100_000)
     return {
         "line_no": line.line_no, "sku": line.product.sku, "quantity": line.quantity,
-        "price": {"gross": line.unit_price, "discount": line.discount},
+        "price": {"amount": line.unit_price, "discount": line.discount},
         "extended_warranty": line.extended_warranty,
         "seller_id": f"S-{seller_number}" if roll < 0.07 else None,  # marketplace launch: 3rd-party sellers
     }

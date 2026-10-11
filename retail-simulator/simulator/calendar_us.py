@@ -1,4 +1,4 @@
-"""Polish retail calendar: public holidays, trading Sundays, Warsaw time and demand seasonality."""
+"""US retail calendar: store closure days, US Eastern time and demand seasonality."""
 
 from __future__ import annotations
 
@@ -24,42 +24,27 @@ def easter_sunday(year: int) -> date:
     return date(year, month, day + 1)
 
 
-def last_sunday(year: int, month: int) -> date:
-    first_of_next = date(year + month // 12, month % 12 + 1, 1)
-    last_day = first_of_next - timedelta(days=1)
-    return last_day - timedelta(days=(last_day.weekday() + 1) % 7)
+def nth_sunday(year: int, month: int, n: int) -> date:
+    first = date(year, month, 1)
+    return first + timedelta(days=(6 - first.weekday()) % 7, weeks=n - 1)
+
+
+def thanksgiving(year: int) -> date:
+    """Fourth Thursday of November."""
+    first_november = date(year, 11, 1)
+    first_thursday = first_november + timedelta(days=(3 - first_november.weekday()) % 7)
+    return first_thursday + timedelta(weeks=3)
 
 
 @lru_cache(maxsize=None)
-def public_holidays(year: int) -> frozenset[date]:
-    easter = easter_sunday(year)
-    holidays = {
-        date(year, 1, 1), date(year, 1, 6), easter, easter + timedelta(days=1),
-        date(year, 5, 1), date(year, 5, 3), easter + timedelta(days=49), easter + timedelta(days=60),
-        date(year, 8, 15), date(year, 11, 1), date(year, 11, 11), date(year, 12, 25), date(year, 12, 26),
-    }
-    if year >= 2025:  # Christmas Eve is a public holiday since 2025
-        holidays.add(date(year, 12, 24))
-    return frozenset(holidays)
-
-
-@lru_cache(maxsize=None)
-def trading_sundays(year: int) -> frozenset[date]:
-    """Last Sunday of Jan/Apr/Jun/Aug, Palm Sunday and the Sundays before Christmas (3 since 2025)."""
-    sundays = {last_sunday(year, month) for month in (1, 4, 6, 8)}
-    sundays.add(easter_sunday(year) - timedelta(days=7))
-    christmas = date(year, 12, 25)
-    sunday_before_christmas = christmas - timedelta(days=(christmas.weekday() + 1) % 7 or 7)
-    december_count = 3 if year >= 2025 else 2
-    sundays.update(sunday_before_christmas - timedelta(weeks=week) for week in range(december_count))
-    return frozenset(sundays - public_holidays(year))
+def store_closures(year: int) -> frozenset[date]:
+    """The chain closes its stores on Easter Sunday, Thanksgiving Day and Christmas Day."""
+    return frozenset({easter_sunday(year), thanksgiving(year), date(year, 12, 25)})
 
 
 def is_trading_day(day: date) -> bool:
-    """Are brick-and-mortar stores allowed to open? Online sales ignore this."""
-    if day in public_holidays(day.year):
-        return False
-    return day.weekday() != 6 or day in trading_sundays(day.year)
+    """Are brick-and-mortar stores open? Online sales ignore this."""
+    return day not in store_closures(day.year)
 
 
 def next_trading_day(day: date) -> date:
@@ -69,24 +54,22 @@ def next_trading_day(day: date) -> date:
     return candidate
 
 
-def warsaw_utc_offset(moment_utc: datetime) -> timedelta:
-    """EU rule: summer time from the last Sunday of March to the last Sunday of October, 01:00 UTC."""
+def eastern_utc_offset(moment_utc: datetime) -> timedelta:
+    """US rule: daylight time from the 2nd Sunday of March 02:00 EST to the 1st Sunday of November 02:00 EDT."""
     year = moment_utc.year
-    summer_start = datetime.combine(last_sunday(year, 3), time(1), tzinfo=UTC)
-    summer_end = datetime.combine(last_sunday(year, 10), time(1), tzinfo=UTC)
-    return timedelta(hours=2) if summer_start <= moment_utc < summer_end else timedelta(hours=1)
+    summer_start = datetime.combine(nth_sunday(year, 3, 2), time(7), tzinfo=UTC)
+    summer_end = datetime.combine(nth_sunday(year, 11, 1), time(6), tzinfo=UTC)
+    return timedelta(hours=-4) if summer_start <= moment_utc < summer_end else timedelta(hours=-5)
 
 
 def local_to_utc(local: datetime) -> datetime:
-    """Naive Europe/Warsaw wall-clock time -> aware UTC (approximate inside the DST switch hour)."""
-    guess = local.replace(tzinfo=UTC) - timedelta(hours=1)
-    return local.replace(tzinfo=UTC) - warsaw_utc_offset(guess)
+    """Naive America/New_York wall-clock time -> aware UTC (approximate inside the DST switch hour)."""
+    guess = local.replace(tzinfo=UTC) + timedelta(hours=5)
+    return local.replace(tzinfo=UTC) - eastern_utc_offset(guess)
 
 
 def black_friday(year: int) -> date:
-    first_november = date(year, 11, 1)
-    first_thursday = first_november + timedelta(days=(3 - first_november.weekday()) % 7)
-    return first_thursday + timedelta(weeks=3, days=1)
+    return thanksgiving(year) + timedelta(days=1)
 
 
 def is_black_week(day: date) -> bool:
@@ -95,7 +78,7 @@ def is_black_week(day: date) -> bool:
 
 
 ONLINE_WEEKDAY_FACTOR = (1.05, 1.0, 1.0, 0.98, 0.95, 0.85, 1.12)
-STORE_WEEKDAY_FACTOR = (0.85, 0.85, 0.9, 0.95, 1.15, 1.45, 1.25)
+STORE_WEEKDAY_FACTOR = (0.85, 0.85, 0.9, 0.95, 1.15, 1.45, 1.1)
 TREND_BASE = date(2025, 1, 1)
 YEARLY_GROWTH = 1.12
 
@@ -110,15 +93,15 @@ def _seasonal_factor(day: date, online: bool) -> float:
         return 2.5 if online else 1.7
     if day.month == 12 and day.day <= 22:
         return 1.6 if online else 1.8
-    if day.month == 12 and day.day == 23:
+    if day.month == 12 and day.day in (23, 24):
         return 1.2 if online else 2.2
-    if day.month == 12 and day.day >= 27:
+    if day.month == 12 and day.day >= 26:
         return 1.15
     if day.month == 1 and day.day <= 20:
         return 0.85
-    if (day.month == 8 and day.day >= 18) or (day.month == 9 and day.day <= 12):
+    if (day.month == 7 and day.day >= 20) or (day.month == 8) or (day.month == 9 and day.day <= 5):
         return 1.25  # back to school
-    if day.month in (6, 7):
+    if day.month == 6:
         return 0.9
     return 1.0
 
@@ -126,7 +109,7 @@ def _seasonal_factor(day: date, online: bool) -> float:
 def demand_multiplier(day: date, channel: str) -> float:
     online = channel == "online"
     weekday = (ONLINE_WEEKDAY_FACTOR if online else STORE_WEEKDAY_FACTOR)[day.weekday()]
-    payday = 1.06 if day.day <= 3 or 10 <= day.day <= 12 else 1.0
+    payday = 1.06 if day.day <= 3 or 15 <= day.day <= 17 else 1.0
     trend = YEARLY_GROWTH ** ((day - TREND_BASE).days / 365.25)
     return weekday * _seasonal_factor(day, online) * payday * trend
 
@@ -137,7 +120,7 @@ _STORE_HOUR_WEIGHTS = (0.5, 0.7, 0.85, 0.9, 0.9, 1.0, 1.2, 1.35, 1.3, 1.0, 0.6) 
 
 ONLINE_HOURS = Weighted(list(enumerate(_ONLINE_HOUR_WEIGHTS)))
 STORE_HOURS_WEEKDAY = Weighted(list(zip(range(10, 21), _STORE_HOUR_WEIGHTS)))
-STORE_HOURS_SUNDAY = Weighted(list(zip(range(10, 18), _STORE_HOUR_WEIGHTS[:8])))  # trading Sundays 10-18
+STORE_HOURS_SUNDAY = Weighted(list(zip(range(11, 19), _STORE_HOUR_WEIGHTS[:8])))  # Sundays 11-19
 
 
 def sample_local_time(rng: random.Random, day: date, hours: Weighted[int]) -> datetime:
