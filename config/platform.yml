@@ -1,0 +1,29 @@
+# Konfiguracja platformy - jedyne miejsce, w którym wpisujemy nazwy.
+# Czyta ją uc_bootstrap.load_config() (bootstrap UC) oraz 00_kickoff.ipynb (ścieżki do volumes).
+#
+# Zasady dla wszystkich nazw: lower snake_case, czyli małe litery, cyfry i "_",
+# zaczyna się od litery. Myślnik, spacja czy wielka litera zatrzymają skrypt jeszcze w dry-run.
+#
+# Pułapka YAML: niecytowane yes/no/on/off/true/false to wartości logiczne, a nie napisy.
+# System o nazwie "no" trzeba by zapisać w cudzysłowie: "no". Loader to wykryje i zgłosi błąd.
+
+# Prefiks wszystkich katalogów: <project>_sources, <project>_dev, <project>_prod.
+project: moustache_markt
+
+# Każde środowisko dostaje własny katalog z identyczną strukturą schematów.
+environments:
+  - dev
+  - prod
+
+# Systemy źródłowe: volume w <project>_sources.landing + schemat bronze_<system> w każdym env.
+# Na razie tylko S1. Systemy S2/S3 dodawaj, gdy będą potrzebne: pricing, rma, wms, ref, web, mkt
+source_systems:
+  - erp
+  - crm
+  - ecom
+  - pos
+
+# Warstwy medallion wspólne dla wszystkich systemów - po jednym schemacie w każdym env.
+curated_layers:
+  - silver
+  - gold
