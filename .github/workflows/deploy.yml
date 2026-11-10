@@ -1,0 +1,87 @@
+# Reusable workflow: uploads the simulator wheel to a Unity Catalog volume on Databricks.
+# It has no trigger of its own - ci.yml (dev) and release.yml (prod) call it with `uses:`.
+#
+# Credentials come from the GitHub *environment* named by the `environment` input
+# (Settings -> Environments -> dev / prod). Setup: docs/ci-cd.md.
+#   secret   DATABRICKS_TOKEN       - encrypted, masked as *** in logs, never readable again
+#   variable DATABRICKS_HOST        - plain text, e.g. https://dbc-1234abcd-5678.cloud.databricks.com
+#   variable DATABRICKS_WHEEL_DIR   - target folder, e.g. /Volumes/moustache_markt_dev/ops/libs
+
+name: Deploy to Databricks
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub environment to deploy to (dev | prod)
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Unlocks this environment's secrets/variables and applies its protection rules
+    # (e.g. prod: wait for a required reviewer to click "Approve").
+    environment: ${{ inputs.environment }}
+    # Never two deployments to the same environment at once; queue instead of cancelling.
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    # The Databricks CLI reads DATABRICKS_HOST and DATABRICKS_TOKEN from the environment.
+    env:
+      DEPLOY_ENV: ${{ inputs.environment }}
+      DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+      WHEEL_DIR: ${{ vars.DATABRICKS_WHEEL_DIR }}
+    steps:
+      # A missing secret is just an empty string - check explicitly instead of failing later
+      # with a confusing CLI error. dev only warns (CI stays green before you set things up),
+      # prod fails, because a silently skipped production release is worse than a red build.
+      - name: Check environment configuration
+        id: config
+        run: |
+          missing=""
+          [ -n "$DATABRICKS_TOKEN" ] || missing="$missing secret:DATABRICKS_TOKEN"
+          [ -n "$DATABRICKS_HOST" ]  || missing="$missing variable:DATABRICKS_HOST"
+          [ -n "$WHEEL_DIR" ]        || missing="$missing variable:DATABRICKS_WHEEL_DIR"
+          if [ -z "$missing" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          message="Environment '$DEPLOY_ENV' is missing:$missing (see docs/ci-cd.md)"
+          if [ "$DEPLOY_ENV" = "prod" ]; then
+            echo "::error::$message"
+            exit 1
+          fi
+          echo "::warning::$message - skipping the deployment."
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+
+      # The wheel uploaded by the caller's `build` job - same workflow run, so no run-id needed.
+      - uses: actions/download-artifact@v8
+        if: steps.config.outputs.ready == 'true'
+        with:
+          name: simulator-wheel
+          path: dist
+
+      - uses: databricks/setup-cli@v1.25.0
+        if: steps.config.outputs.ready == 'true'
+
+      - name: Check authentication
+        if: steps.config.outputs.ready == 'true'
+        run: databricks current-user me --output json | jq -r '"Authenticated as " + .userName'
+
+      # Volumes are addressed with the dbfs: scheme: dbfs:/Volumes/<catalog>/<schema>/<volume>/...
+      # The file name keeps the version (pip requires it), so older versions stay available.
+      - name: Upload the wheel
+        if: steps.config.outputs.ready == 'true'
+        run: |
+          databricks fs mkdir "dbfs:$WHEEL_DIR"
+          echo "### Deployed to \`$DEPLOY_ENV\`" >> "$GITHUB_STEP_SUMMARY"
+          for wheel in dist/*.whl; do
+            databricks fs cp "$wheel" "dbfs:$WHEEL_DIR/" --overwrite
+            echo "- \`$WHEEL_DIR/$(basename "$wheel")\`" >> "$GITHUB_STEP_SUMMARY"
+          done
+          databricks fs ls "dbfs:$WHEEL_DIR"

@@ -8,7 +8,6 @@ new column energy_star. Category and location files do not change.
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
-from decimal import Decimal
 
 from .formats import UTC, us_amount
 from .rng import make_rng

@@ -1,0 +1,135 @@
+# Continuous Integration: runs on every push to main and on every pull request.
+#
+#   lint ─┐
+#         ├─> build (wheel = artifact) ─> smoke (installs that wheel) ─> deploy-dev (main only)
+#   test ─┘
+#   uc-plan (independent)
+#
+# Jobs without `needs:` run in parallel on separate, fresh virtual machines.
+# Files do NOT survive between jobs - that is what artifacts are for (build -> smoke -> deploy-dev).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: # "Run workflow" button in the Actions tab
+
+# A new commit on the same branch/PR cancels the run that is still in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege for the automatic GITHUB_TOKEN: this workflow only reads the repo.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      # Pinned version: a new ruff release with new rules should not turn CI red by itself.
+      - run: pip install ruff==0.17.4
+      # --output-format=github -> errors show up as annotations on the PR's changed lines.
+      - run: ruff check --output-format=github .
+
+  test:
+    # Matrix: the same job once per Python version, in parallel.
+    strategy:
+      fail-fast: false # let the other versions finish even if one fails
+      matrix:
+        python-version: ["3.10", "3.12", "3.13"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip # pip download cache, keyed by the hash of requirements-dev.txt
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: pytest --junitxml=reports/junit.xml
+      # Artifact #1: the test report. if: always() -> uploaded also when tests fail,
+      # which is exactly when you want to download it.
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: test-report-py${{ matrix.python-version }} # names must be unique within a run
+          path: reports/
+          retention-days: 14
+
+  uc-plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml
+      - run: python uc_bootstrap.py --dry-run > uc-plan.sql
+      # Job summary: Markdown appended to $GITHUB_STEP_SUMMARY is shown on the run's page.
+      - name: Add the plan to the job summary
+        run: |
+          {
+            echo "### Unity Catalog plan ($(wc -l < uc-plan.sql) statements)"
+            echo '```sql'
+            cat uc-plan.sql
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      # Artifact #2: the SQL plan, so a reviewer can see what a config change would create.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: uc-plan
+          path: uc-plan.sql
+
+  build:
+    needs: [lint, test] # do not package code that fails lint or tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build retail-simulator --outdir dist
+      # Artifact #3: the wheel. Built ONCE here; smoke and deploy-dev download this exact file.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: simulator-wheel
+          path: dist/*.whl
+          if-no-files-found: error
+
+  smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # No checkout on purpose: the job sees only the wheel, so it proves the package
+      # is self-contained (no missing files, working `retail-sim` entry point).
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: simulator-wheel
+          path: dist
+      - run: pip install "$(ls dist/*.whl)[parquet]"
+      - run: retail-sim backfill --start 2025-01-01 --end 2025-01-07 --scale 0.05 --output sample-data
+      # Artifact #4: a small data sample - download it from the run page and inspect it locally.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sample-data
+          path: sample-data/
+          retention-days: 7
+
+  # Continuous deployment: every green commit on main lands on the dev workspace.
+  deploy-dev:
+    needs: smoke
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/deploy.yml # reusable workflow, see deploy.yml
+    with:
+      environment: dev

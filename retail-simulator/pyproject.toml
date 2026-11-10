@@ -1,0 +1,31 @@
+# Packaging metadata: turns the `simulator` folder into an installable wheel
+# (retail_simulator-<version>-py3-none-any.whl). Built by CI, published by release.yml.
+#   python -m build retail-simulator --outdir dist    # local build
+#   pip install "dist/retail_simulator-0.1.0-py3-none-any.whl[parquet]"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "retail-simulator"
+# The version lives in one place only: simulator/__init__.py (__version__).
+dynamic = ["version"]
+description = "Deterministic source-system simulator for a fictional New England electronics retail chain"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+# pyarrow is preinstalled on Databricks, so it is optional: only ERP Parquet output needs it.
+parquet = ["pyarrow>=15"]
+
+[project.scripts]
+# After `pip install`, the CLI is available as a command: retail-sim backfill --end ... --output ...
+retail-sim = "simulator.cli:main"
+
+[tool.hatch.version]
+path = "simulator/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["simulator"]

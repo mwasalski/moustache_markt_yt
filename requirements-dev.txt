@@ -1,0 +1,4 @@
+# Everything the tests need. CI: pip install -r requirements-dev.txt
+pytest>=8
+pyyaml>=6
+pyarrow>=15

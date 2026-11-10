@@ -1,0 +1,16 @@
+# Tool configuration only (no [project] table): the installable package is retail-simulator/.
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+# Globals injected by Databricks into every notebook.
+builtins = ["spark", "dbutils", "display"]
+
+[tool.ruff.lint]
+# Syntax errors + pyflakes (undefined names, unused imports...): CI fails on bugs, not on style.
+select = ["E9", "F"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "retail-simulator/tests"]
+# Import from the source folders without installing anything.
+pythonpath = [".", "retail-simulator"]

@@ -1,0 +1,69 @@
+# Release: pushing a tag sim-v<version> publishes the simulator for the team and for production.
+#
+#   1. bump __version__ in retail-simulator/simulator/__init__.py, commit, push
+#   2. git tag sim-v0.2.0 && git push origin sim-v0.2.0
+#
+#   build ─┬─> github-release (wheel attached to a GitHub Release - permanent, pip-installable)
+#          └─> deploy-prod    (waits for approval if the prod environment requires a reviewer)
+
+name: Release simulator
+
+on:
+  push:
+    tags: ["sim-v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      # The tag is a promise about the version inside the wheel - verify it before publishing.
+      - name: Check that the tag matches __version__
+        run: |
+          tag_version="${GITHUB_REF_NAME#sim-v}"
+          code_version=$(python -c "import sys; sys.path.insert(0, 'retail-simulator'); import simulator; print(simulator.__version__)")
+          if [ "$tag_version" != "$code_version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match __version__ = $code_version"
+            exit 1
+          fi
+      - run: pip install build
+      - run: python -m build retail-simulator --outdir dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: simulator-wheel
+          path: dist/*.whl
+          if-no-files-found: error
+
+  github-release:
+    needs: build
+    runs-on: ubuntu-latest
+    # Only this job may write to the repo (create a release). Everything else stays read-only.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: simulator-wheel
+          path: dist
+      # GITHUB_TOKEN is a secret GitHub creates for every run - nothing to configure.
+      # It expires when the job ends and has only the permissions declared above.
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.whl \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "retail-simulator ${GITHUB_REF_NAME#sim-v}" \
+            --generate-notes
+
+  deploy-prod:
+    needs: build
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: prod
