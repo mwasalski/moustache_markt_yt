@@ -41,9 +41,10 @@ jobs:
   test:
     # Matrix: the same job once per Python version, in parallel.
     strategy:
-      fail-fast: false # let the other versions finish even if one fails
+      fail-fast: false # let the other versions finish even if one fails, it will test all versions no matter what
       matrix:
-        python-version: ["3.10", "3.12", "3.13"]
+        python-version: ["3.10", "3.12", "3.13"] # checks if these versions are available and installed on given machine
+        # + it will validate code if code can run against all three versions
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -51,13 +52,14 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip # pip download cache, keyed by the hash of requirements-dev.txt
-          cache-dependency-path: requirements-dev.txt
+          cache-dependency-path: requirements-dev.txt # uv better here
       - run: pip install -r requirements-dev.txt
       - run: pytest --junitxml=reports/junit.xml
       # Artifact #1: the test report. if: always() -> uploaded also when tests fail,
       # which is exactly when you want to download it.
       - uses: actions/upload-artifact@v7
         if: always()
+        # if always will run what is after uses: even if previous have fallen
         with:
           name: test-report-py${{ matrix.python-version }} # names must be unique within a run
           path: reports/
@@ -70,7 +72,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install pyyaml
+      - run: pip install pyyaml # change to uv
       - run: python uc_bootstrap.py --dry-run > uc-plan.sql
       # Job summary: Markdown appended to $GITHUB_STEP_SUMMARY is shown on the run's page.
       - name: Add the plan to the job summary
@@ -83,12 +85,12 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       # Artifact #2: the SQL plan, so a reviewer can see what a config change would create.
       - uses: actions/upload-artifact@v7
-        with:
+        with: # to check parent repo
           name: uc-plan
           path: uc-plan.sql
 
   build:
-    needs: [lint, test] # do not package code that fails lint or tests
+    needs: [lint, test] # do not package code that fails lint or tests, check how or statement looks like
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -100,7 +102,7 @@ jobs:
       # Artifact #3: the wheel. Built ONCE here; smoke and deploy-dev download this exact file.
       - uses: actions/upload-artifact@v7
         with:
-          name: simulator-wheel
+          name: simulator-wheel #github 'thing', to be checked
           path: dist/*.whl
           if-no-files-found: error
 
