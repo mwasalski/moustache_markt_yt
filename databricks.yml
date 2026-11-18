@@ -1,0 +1,19 @@
+# This is a Declarative Automation Bundle definition for moustache_markt_yt.
+# The Databricks extension requires databricks.yml configuration file.
+# See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
+
+bundle:
+  name: moustache_markt_yt
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://dbc-af2fcbef-7d92.cloud.databricks.com
+
+  ## Optionally, there could be 'staging' or 'prod' targets here.
+  #
+  # prod:
+  #   workspace:
+  #     host: https://dbc-af2fcbef-7d92.cloud.databricks.com
